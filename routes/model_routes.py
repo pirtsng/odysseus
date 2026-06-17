@@ -1118,8 +1118,12 @@ def setup_model_routes(model_discovery):
                             "base": info["base"],
                             "api_key": info["api_key"],
                             "timeout": info["timeout"],
+                            "endpoint_kinds": {},
                             "endpoint_ids": [],
-                        })["endpoint_ids"].append(info["id"])
+                        })
+                        grp = groups[info["key"]]
+                        grp["endpoint_ids"].append(info["id"])
+                        grp["endpoint_kinds"][info["id"]] = info["kind"]
 
                     for key in groups:
                         st = _refresh_state.setdefault(key, {})
@@ -1128,22 +1132,52 @@ def setup_model_routes(model_discovery):
 
                     def _probe_one(key: str, data: Dict[str, Any]):
                         try:
-                            ids = _probe_endpoint(data["base"], data.get("api_key"), timeout=data.get("timeout") or 2)
-                            return key, data["endpoint_ids"], ids, None
+                            endpoint_kinds = data.get("endpoint_kinds", {})
+                            is_aggregator = any(
+                                k in ("api", "proxy") for k in endpoint_kinds.values()
+                            )
+                            if is_aggregator:
+                                # Aggregator endpoints: fetch the full models response with
+                                # provider details and store the raw JSON in cached_models.
+                                base = data["base"].rstrip("/")
+                                sep = "&" if "?" in base else "?"
+                                url = f"{base}/models{sep}type=chat&include_providers=true"
+                                headers = _safe_build_headers(data.get("api_key"), base)
+                                try:
+                                    r = httpx.get(url, headers=headers, timeout=data.get("timeout") or 10)
+                                    r.raise_for_status()
+                                    raw_text = r.text
+                                    # Parse to extract simple model IDs for validation
+                                    parsed = r.json()
+                                    ids = [m.get("id") for m in (parsed.get("data") or []) if m.get("id")]
+                                    # Store the full JSON string so provider details are available
+                                    return key, data["endpoint_ids"], ids, None, raw_text
+                                except Exception as e:
+                                    return key, data["endpoint_ids"], None, e, None
+                            else:
+                                ids = _probe_endpoint(data["base"], data.get("api_key"), timeout=data.get("timeout") or 2)
+                                return key, data["endpoint_ids"], ids, None, None
                         except Exception as e:
-                            return key, data["endpoint_ids"], None, e
+                            return key, data["endpoint_ids"], None, e, None
 
                     if groups:
                         with ThreadPoolExecutor(max_workers=min(4, len(groups))) as pool:
                             futures = [pool.submit(_probe_one, key, data) for key, data in groups.items()]
                             for fut in as_completed(futures):
-                                key, endpoint_ids, ids, err = fut.result()
+                                result = fut.result()
+                                key, endpoint_ids, ids, err = result[0], result[1], result[2], result[3]
+                                raw_text = result[4] if len(result) > 4 else None
                                 st = _refresh_state.setdefault(key, {})
                                 if ids:
                                     for ep_id in endpoint_ids:
                                         ep_obj = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
                                         if ep_obj:
-                                            ep_obj.cached_models = json.dumps(ids)
+                                            # Aggregator endpoints: store the full JSON response
+                                            # (with provider details) instead of just model ID list.
+                                            if raw_text:
+                                                ep_obj.cached_models = raw_text
+                                            else:
+                                                ep_obj.cached_models = json.dumps(ids)
                                             changed = True
                                     st["last_success"] = _time.time()
                                     st["fail_count"] = 0

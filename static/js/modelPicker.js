@@ -187,6 +187,51 @@ function _initModelPickerDropdown() {
       // pill. The user can still click and try anyway (matches the
       // existing "local server appears offline" path on line 301).
       const epOffline = !!item.offline;
+
+      // ── Aggregator endpoint: parse cached_models for provider data ──
+      let _aggParsed = null;
+      if (item.cached_models && !epOffline) {
+        try {
+          const parsed = typeof item.cached_models === 'string' ? JSON.parse(item.cached_models) : item.cached_models;
+          if (parsed && Array.isArray(parsed.data) && parsed.data.some(m => Array.isArray(m.providers) && m.providers.length > 0)) {
+            _aggParsed = parsed;
+          }
+        } catch (_e) { /* not aggregator JSON */ }
+      }
+
+      if (_aggParsed) {
+        // Aggregator: create provider-aware model entries from cached data.
+        _aggParsed.data.forEach(model => {
+          if (!model.id || !Array.isArray(model.providers) || model.providers.length === 0) return;
+          if (seen.has(model.id)) return;
+          seen.add(model.id);
+          const providers = model.providers.map(p => ({
+            name: p.name,
+            context_length: p.context_length,
+            max_completion_tokens: p.max_completion_tokens,
+            prompt_price: parseFloat(p.pricing?.prompt_per_million) || 0,
+            completion_price: parseFloat(p.pricing?.completion_per_million) || 0,
+          }));
+          result.push({
+            mid: model.id,
+            display: model.id.split('/').pop(),
+            url: item.url,
+            endpointId: item.endpoint_id,
+            epName: item.endpoint_name || '',
+            providerText: [
+              item.endpoint_name || '',
+              item.url || '',
+            ].filter(Boolean).join(' '),
+            stale: false,
+            staleReason: '',
+            offline: false,
+            _providers: providers,
+          });
+        });
+        return; // skip normal model processing for aggregator endpoints
+      }
+
+      // ── Normal / local endpoint: existing flat list behavior ──
       const allModels = (item.models || []).concat(item.models_extra || []);
       const allDisplay = (item.models_display || []).concat(item.models_extra_display || []);
       // Mark local endpoints whose live probe failed.
@@ -304,6 +349,96 @@ function _initModelPickerDropdown() {
       empty.textContent = text;
       listEl.appendChild(empty);
     }
+    function _fmtCtx(val) {
+      if (!val) return '';
+      const n = Number(val);
+      if (n >= 1000000) return (n / 1000000).toFixed(0) + 'M ctx';
+      if (n >= 1000) return (n / 1000).toFixed(0) + 'K ctx';
+      return n + ' ctx';
+    }
+    function _fmtMax(val) {
+      if (!val) return '';
+      const n = Number(val);
+      if (n >= 1000000) return (n / 1000000).toFixed(0) + 'M max';
+      if (n >= 1000) return (n / 1000).toFixed(0) + 'K max';
+      return n + ' max';
+    }
+    function _fmtPrice(val) {
+      if (!val) return '—';
+      return val.toFixed(2);
+    }
+
+    // ── Aggregator model header with expandable provider sub-rows ──
+    const _expandedModels = new Set(_loadList('odysseus-model-expanded'));
+
+    function _addAggregatorModel(m) {
+      if (!m._providers || !m._providers.length) {
+        _addRow(m);
+        return;
+      }
+
+      const isExpanded = _expandedModels.has(m.mid);
+
+      // Model header row — collapsible
+      const header = document.createElement('div');
+      header.className = 'model-switch-item mp-agg-header';
+      header.innerHTML =
+        `<span class="mp-agg-chevron${isExpanded ? '' : ' collapsed'}">${isExpanded ? '▼' : '▶'}</span>`
+        + `<span class="mp-model-name">${m.display}</span>`
+        + `<span class="model-switch-ep">${m._providers.length} provider${m._providers.length !== 1 ? 's' : ''}</span>`;
+      header.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (_expandedModels.has(m.mid)) _expandedModels.delete(m.mid);
+        else _expandedModels.add(m.mid);
+        _saveList('odysseus-model-expanded', [..._expandedModels]);
+        const st = listEl.scrollTop;
+        _populate(q);
+        listEl.scrollTop = st;
+      });
+      listEl.appendChild(header);
+
+      if (!isExpanded) return;
+
+      // Provider sub-rows
+      m._providers.forEach(p => {
+        const row = document.createElement('div');
+        row.className = 'model-switch-item mp-provider-row';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'mp-provider-name';
+        nameSpan.textContent = p.name;
+        row.appendChild(nameSpan);
+
+        const infoSpan = document.createElement('span');
+        infoSpan.className = 'mp-provider-info';
+        infoSpan.textContent = _fmtCtx(p.context_length) + ' · ' + _fmtMax(p.max_completion_tokens);
+        row.appendChild(infoSpan);
+
+        const priceSpan = document.createElement('span');
+        priceSpan.className = 'mp-provider-price';
+        const promptStr = _fmtPrice(p.prompt_price);
+        const compStr = _fmtPrice(p.completion_price);
+        priceSpan.textContent = promptStr + ' / ' + compStr + ' ₽/M';
+        row.appendChild(priceSpan);
+
+        row.addEventListener('click', (e) => {
+          e.stopPropagation();
+          // Store provider preference by appending |provider_name to model id
+          const providerMid = m.mid + '|' + p.name;
+          _pick({
+            mid: providerMid,
+            display: m.display,
+            url: m.url,
+            endpointId: m.endpointId,
+            epName: m.epName,
+            providerText: m.providerText,
+            _selectedProvider: p.name,
+          });
+        });
+        listEl.appendChild(row);
+      });
+    }
+
     function _addRow(m) {
       const row = document.createElement('div');
       row.className = 'model-switch-item';
@@ -376,6 +511,16 @@ function _initModelPickerDropdown() {
       row.addEventListener('click', () => _pick(m));
       listEl.appendChild(row);
     }
+
+    // Route models with aggregator provider data through the expandable renderer
+    const _origAddRow = _addRow;
+    _addRow = function _addRow(m) {
+      if (m._providers && m._providers.length) {
+        _addAggregatorModel(m);
+      } else {
+        _origAddRow(m);
+      }
+    };
 
     // ── Search mode: flat, filtered results across the whole catalog ──
     if (q) {
@@ -481,6 +626,25 @@ function _initModelPickerDropdown() {
     const currentSessionId = _deps.getCurrentSessionId();
     const _pendingChat = _deps.getPendingChat();
 
+    // If model has a |provider_name suffix, extract and store the provider
+    // preference, then strip it for backend communication.
+    let _actualMid = m.mid;
+    let _selectedProvider = m._selectedProvider || '';
+    const _pipeIdx = _actualMid.indexOf('|');
+    if (_pipeIdx > 0 && !_selectedProvider) {
+      _selectedProvider = _actualMid.slice(_pipeIdx + 1);
+      _actualMid = _actualMid.slice(0, _pipeIdx);
+    }
+    // Store the selected provider on the btn element for later retrieval
+    // by chatStream.js or other consumers that need to send provider.only.
+    if (_selectedProvider) {
+      btn.dataset.selectedProvider = _selectedProvider;
+      btn.dataset.actualModel = _actualMid;
+    } else {
+      delete btn.dataset.selectedProvider;
+      delete btn.dataset.actualModel;
+    }
+
     // Remember this pick so it surfaces under "Recent" next time the picker
     // opens — the whole point of quick-switch.
     if (m && m.mid) _pushRecent(m.mid);
@@ -499,18 +663,18 @@ function _initModelPickerDropdown() {
     }
     if (!currentSessionId && _pendingChat) {
       // Already have a deferred session — just update the model
-      _deps.setPendingChat({ url: m.url, modelId: m.mid, endpointId: m.endpointId });
+      _deps.setPendingChat({ url: m.url, modelId: _actualMid, endpointId: m.endpointId });
       // Header stays as session name — model switch only updates picker
       updateModelPicker();
       uiModule.showToast(`Using ${m.display}`);
       return;
     } else if (!currentSessionId) {
       // No session yet — create one with this model
-      await _deps.createDirectChat(m.url, m.mid, m.endpointId);
+      await _deps.createDirectChat(m.url, _actualMid, m.endpointId);
     } else {
       // Existing session with no model — PATCH it
       const fd = new FormData();
-      fd.append('model', m.mid);
+      fd.append('model', _actualMid);
       fd.append('endpoint_url', m.url);
       if (m.endpointId) fd.append('endpoint_id', m.endpointId);
       try {
@@ -521,7 +685,7 @@ function _initModelPickerDropdown() {
         }
         const sessions = _deps.getSessions();
         const s = sessions.find(x => x.id === currentSessionId);
-        if (s) { s.model = m.mid; s.endpoint_url = m.url; }
+        if (s) { s.model = _actualMid; s.endpoint_url = m.url; }
         // Header stays as session name — model info shown in picker only
       } catch (e) {
         uiModule.showError('Failed to set model: ' + e);

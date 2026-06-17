@@ -15,6 +15,18 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# Provider preferences for aggregator endpoints (Polza.ai, OpenRouter, etc.).
+# Call set_provider_preference(model_id, provider_name) before sending a request
+# to inject provider: {only: [provider_name]} into the payload's extra_body.
+_provider_preferences: Dict[str, str] = {}  # model_id -> provider_name
+
+def set_provider_preference(model_id: str, provider_name: str):
+    """Set which sub-provider to use for a given model on aggregator endpoints."""
+    _provider_preferences[model_id] = provider_name
+
+def _get_provider_preference(model_id: str) -> Optional[str]:
+    return _provider_preferences.get(model_id)
+
 class LLMConfig:
     """Configuration constants for LLM operations."""
     DEFAULT_TIMEOUT = 30
@@ -1317,6 +1329,11 @@ def list_model_ids(
     provider = _detect_provider(base_chat_url)
     if provider == "anthropic":
         return list(ANTHROPIC_MODELS)
+    # Aggregator endpoints: avoid live /v1/models probe; cached_models is
+    # populated by the auto-refresh subsystem (Fix 2).
+    from src.model_context import _configured_endpoint_kind
+    if _configured_endpoint_kind(base_chat_url) in ("api", "proxy"):
+        return cached or []
     try:
         h = {}
         if headers:
@@ -1630,6 +1647,10 @@ async def llm_call_async(
         # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+        # For aggregator endpoints, inject provider selection from user preference.
+        provider_pref = _get_provider_preference(model)
+        if provider_pref:
+            payload["provider"] = {"only": [provider_pref]}
         _apply_local_cache_affinity(payload, url, session_id)
 
     if _is_host_dead(target_url):
@@ -1753,6 +1774,10 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+        # For aggregator endpoints, inject provider selection from user preference.
+        provider_pref = _get_provider_preference(model)
+        if provider_pref:
+            payload["provider"] = {"only": [provider_pref]}
         _apply_local_cache_affinity(payload, url, session_id)
         h = _provider_headers(provider, headers)
         if provider == "copilot":
@@ -2100,7 +2125,16 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                 )
                                 if "usage" in j and not _delta_has_output:
                                     u = j["usage"] or {}
-                                    _usage_data = {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)}
+                                    _usage_data = {
+                                        "input_tokens": u.get("prompt_tokens", 0),
+                                        "output_tokens": u.get("completion_tokens", 0),
+                                    }
+                                    # Aggregator endpoints (Polza.ai, OpenRouter, etc.) include
+                                    # the actual cost in the usage block.
+                                    if "cost_rub" in u:
+                                        _usage_data["cost_rub"] = float(u["cost_rub"])
+                                    elif "cost" in u:
+                                        _usage_data["cost_rub"] = float(u["cost"])
                                     # llama.cpp puts a `timings` block alongside `usage` with the
                                     # TRUE generation speed (predicted_per_second) — pure decode,
                                     # excluding prefill/network. Pass it through so the UI shows the

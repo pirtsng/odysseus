@@ -1703,9 +1703,11 @@ export function displayMetrics(messageElement, metrics) {
   const ctxPct = metrics.context_percent;
   const model = metrics.model || 'Unknown';
   const cost = _billableCost(model, inputTokens, outputTokens);
+  // cost_rub from aggregator endpoints (e.g. Polza.ai) — actual ruble cost
+  const costRub = metrics.cost_rub != null ? parseFloat(metrics.cost_rub) : null;
 
   // Nothing useful to show — bail out (only if ALL metrics are missing)
-  if (!responseTime && !outputTokens && tps == null && !ctxPct) return;
+  if (!responseTime && !outputTokens && tps == null && !ctxPct && costRub == null) return;
 
   // Accumulate session cost (only on fresh metrics, not history reload)
   if (!metrics._fromHistory) {
@@ -1718,19 +1720,39 @@ export function displayMetrics(messageElement, metrics) {
       } catch (_e) { /* ignore */ }
       updateSessionCostUI();
     }
+    // Also track actual ruble cost from aggregator endpoints
+    if (_sid && costRub != null) {
+      try {
+        const _rubCosts = JSON.parse(localStorage.getItem(_COST_KEY + '-rub') || '{}');
+        _rubCosts[_sid] = (_rubCosts[_sid] || 0) + costRub;
+        localStorage.setItem(_COST_KEY + '-rub', JSON.stringify(_rubCosts));
+      } catch (_e) { /* ignore */ }
+    }
   }
 
   // Default: show tok/s if available, else fall back to other stats
   const costStr0 = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : null;
-  const metricsLabel = tps != null && tps !== 'undefined'
-    ? `${tps} tok/s`
-    : costStr0
-      ? `${outputTokens} tok · ${costStr0}`
-      : outputTokens
-        ? `${outputTokens} tok · ${responseTime != null ? responseTime + 's' : ''}`
-        : responseTime != null
-          ? `${responseTime}s`
-          : '';
+  const costRubStr = costRub != null ? `${costRub.toFixed(4)} ₽` : null;
+  let metricsLabel;
+  if (tps != null && tps !== 'undefined') {
+    metricsLabel = `${tps} tok/s`;
+  } else if (costStr0) {
+    metricsLabel = `${outputTokens} tok · ${costStr0}`;
+  } else if (outputTokens) {
+    metricsLabel = `${outputTokens} tok · ${responseTime != null ? responseTime + 's' : ''}`;
+  } else if (responseTime != null) {
+    metricsLabel = `${responseTime}s`;
+  } else {
+    metricsLabel = '';
+  }
+  // Append actual ruble cost when available (overrides computed USD cost display)
+  if (costRubStr) {
+    if (metricsLabel) {
+      metricsLabel += ` · ${costRubStr}`;
+    } else {
+      metricsLabel = costRubStr;
+    }
+  }
   if (!metricsLabel) return;
   metricsContainer.textContent = metricsLabel;
   metricsContainer.style.cursor = 'pointer';
@@ -1744,7 +1766,9 @@ export function displayMetrics(messageElement, metrics) {
     document.querySelectorAll('.ctx-popup').forEach(p => { if (typeof p._dismiss === 'function') p._dismiss(); else p.remove(); });
 
     const costStr = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : '';
+    const costRubStr = costRub != null ? `${costRub.toFixed(4)} ₽` : '';
     const costRows = costStr ? `<div><span class="ctx-label">Cost</span> ${costStr}</div>` : '';
+    const costRubRow = costRubStr ? `<div><span class="ctx-label">Cost (₽)</span> ${costRubStr}</div>` : '';
     const speedStr = tps != null && tps !== 'undefined' ? `${tps} tok/s` : 'n/a';
     const totalTok = inputTokens + outputTokens;
     const ctxColor = ctxPct >= 85 ? 'var(--red, #e06c75)' : ctxPct >= 70 ? '#ff9900' : 'var(--color-muted-alt, #6b7280)';
@@ -1761,6 +1785,18 @@ export function displayMetrics(messageElement, metrics) {
     if (costStr && sc > 0) {
       sessionCostStr = `<div><span class="ctx-label">Session</span> $${sc < 0.01 ? sc.toFixed(4) : sc.toFixed(3)}</div>`;
     }
+    // Session total in rubles (for aggregator endpoints)
+    let sessionCostRubStr = '';
+    if (costRubStr) {
+      try {
+        const _rubCosts = JSON.parse(localStorage.getItem(_COST_KEY + '-rub') || '{}');
+        const _sid = window.sessionModule && window.sessionModule.getCurrentSessionId();
+        const totalRub = _sid ? (_rubCosts[_sid] || 0) : 0;
+        if (totalRub > 0) {
+          sessionCostRubStr = `<div><span class="ctx-label">Session (₽)</span> ${totalRub.toFixed(4)} ₽</div>`;
+        }
+      } catch (_e) { /* ignore */ }
+    }
 
     const popup = document.createElement('div');
     popup.className = 'ctx-popup';
@@ -1775,7 +1811,9 @@ export function displayMetrics(messageElement, metrics) {
       ${prepTime != null ? `<div><span class="ctx-label">Prep</span> ${prepTime}s</div>` : ''}
       ${modelWaitTime != null ? `<div><span class="ctx-label">Model wait</span> ${modelWaitTime}s</div>` : ''}
       ${costRows}
+      ${costRubRow}
       ${sessionCostStr}
+      ${sessionCostRubStr}
       ${prepDetails ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border);font-size:0.85em;opacity:0.8;">
         <div style="font-weight:600;margin-bottom:4px;color:var(--fg);">Agent prep</div>
         ${prepDetails}
