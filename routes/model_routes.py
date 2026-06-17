@@ -1228,11 +1228,34 @@ def setup_model_routes(model_discovery):
             provider = _safe_detect_provider(base)
             # Merge cached + pinned models, then filter out hidden ones
             ep_model_type = getattr(ep, "model_type", None) or "llm"
-            model_ids = _visible_models(
-                _cached_model_ids(ep),
-                ep.hidden_models,
-                getattr(ep, "pinned_models", None),
-            )
+
+            # Aggregator endpoints (e.g. Polza.ai) store the full JSON response
+            # with provider details in cached_models. Detect this format and
+            # extract proper model IDs from the JSON data array instead of using
+            # _cached_model_ids() which splits on commas and corrupts the list.
+            _raw_cm = getattr(ep, "cached_models", None)
+            _agg_models = None
+            if isinstance(_raw_cm, str):
+                try:
+                    _p = json.loads(_raw_cm)
+                    if isinstance(_p, dict) and isinstance(_p.get("data"), list):
+                        _ids = [m["id"] for m in _p["data"] if isinstance(m, dict) and m.get("id")]
+                        if _ids:
+                            _agg_models = _ids
+                except Exception:
+                    pass
+            if _agg_models is not None:
+                model_ids = _visible_models(
+                    _agg_models,
+                    ep.hidden_models,
+                    getattr(ep, "pinned_models", None),
+                )
+            else:
+                model_ids = _visible_models(
+                    _cached_model_ids(ep),
+                    ep.hidden_models,
+                    getattr(ep, "pinned_models", None),
+                )
             # Build correct URL based on provider
             chat_url = build_chat_url(base)
             kind = _effective_endpoint_kind(ep, base)
@@ -1248,7 +1271,7 @@ def setup_model_routes(model_discovery):
                     if m not in curated:
                         curated.append(m)
                 extra = [m for m in extra if m not in pinned]
-                items.append({
+                _item = {
                     "host": "custom",
                     "port": 0,
                     "url": chat_url,
@@ -1261,10 +1284,12 @@ def setup_model_routes(model_discovery):
                     "category": category,
                     "endpoint_kind": kind,
                     "model_type": ep_model_type,
-                })
+                }
+                if _agg_models is not None:
+                    _item["cached_models"] = _raw_cm
+                items.append(_item)
             else:
-                # Endpoint unreachable but still show it greyed out
-                items.append({
+                _item = {
                     "host": "custom",
                     "port": 0,
                     "url": chat_url,
@@ -1278,7 +1303,10 @@ def setup_model_routes(model_discovery):
                     "endpoint_kind": kind,
                     "model_type": ep_model_type,
                     "offline": True,
-                })
+                }
+                if _agg_models is not None:
+                    _item["cached_models"] = _raw_cm
+                items.append(_item)
 
         return {"hosts": [], "items": items}
 

@@ -628,11 +628,16 @@ function _initModelPickerDropdown() {
 
     // If model has a |provider_name suffix, extract and store the provider
     // preference, then strip it for backend communication.
+    // The suffix may come from the row click handler in _addAggregatorModel()
+    // (which sets _selectedProvider directly) OR from the model ID itself
+    // (e.g. from Recent/Favorites persistence). Handle both cases.
     let _actualMid = m.mid;
     let _selectedProvider = m._selectedProvider || '';
     const _pipeIdx = _actualMid.indexOf('|');
-    if (_pipeIdx > 0 && !_selectedProvider) {
-      _selectedProvider = _actualMid.slice(_pipeIdx + 1);
+    if (_pipeIdx > 0) {
+      if (!_selectedProvider) {
+        _selectedProvider = _actualMid.slice(_pipeIdx + 1);
+      }
       _actualMid = _actualMid.slice(0, _pipeIdx);
     }
     // Store the selected provider on the btn element for later retrieval
