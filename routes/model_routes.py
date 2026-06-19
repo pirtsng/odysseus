@@ -435,7 +435,13 @@ def _parse_model_list(raw: Any) -> List[str]:
             return []
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, list):
+            # Aggregator endpoints (e.g. Polza.ai) store the full JSON response
+            # with provider details in cached_models: {"data": [{"id": ..., ...}, ...]}.
+            # Extract model IDs from the data array instead of falling through
+            # to re.split() which would shred the JSON into garbage strings.
+            if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+                value = [m["id"] for m in parsed["data"] if isinstance(m, dict) and m.get("id")]
+            elif isinstance(parsed, list):
                 value = parsed
             else:
                 value = re.split(r"[\n,]+", text)
@@ -1664,6 +1670,7 @@ def setup_model_routes(model_discovery):
                     "status": status,
                     "ping_error": (ping or {}).get("error") if ping else None,
                     "model_type": getattr(r, "model_type", None) or "llm",
+                    "cached_models": getattr(r, "cached_models", None),
                     "supports_tools": getattr(r, "supports_tools", None),
                     "endpoint_kind": kind,
                     "category": _classify_endpoint(base, kind),
@@ -2090,10 +2097,12 @@ def setup_model_routes(model_discovery):
             _user_prefs = _load_for_user(_user) or {}
             ep_id = (_user_prefs.get("default_endpoint_id") or "").strip()
             model = (_user_prefs.get("default_model") or "").strip()
+            provider = (_user_prefs.get("default_provider") or "").strip()
             _fallbacks = _user_prefs.get("default_model_fallbacks") or []
         else:
             ep_id = settings.get("default_endpoint_id", "")
             model = settings.get("default_model", "")
+            provider = settings.get("default_provider", "")
             _fallbacks = settings.get("default_model_fallbacks") or []
         db = SessionLocal()
         try:
@@ -2147,7 +2156,7 @@ def setup_model_routes(model_discovery):
                     _last_q = owner_filter(_last_q, ModelEndpoint, _user, include_shared=False)
                 ep = _last_q.first()
             if not ep:
-                return {"endpoint_id": "", "endpoint_url": "", "model": ""}
+                return {"endpoint_id": "", "endpoint_url": "", "model": "", "default_provider": ""}
             base = _normalize_base(ep.base_url)
             chat_url = build_chat_url(base)
             if not model and (getattr(ep, "cached_models", None) or getattr(ep, "pinned_models", None)):
@@ -2157,7 +2166,13 @@ def setup_model_routes(model_discovery):
                         model = visible[0]
                 except Exception:
                     pass
-            return {"endpoint_id": ep.id, "endpoint_url": chat_url, "model": model}
+            # Wire the default provider preference so aggregator endpoints
+            # (Polza.ai, OpenRouter, etc.) inject provider: {only: [name]}
+            # into the LLM request payload automatically.
+            if model and provider:
+                from src.llm_core import set_provider_preference as _set_prov_pref
+                _set_prov_pref(model, provider)
+            return {"endpoint_id": ep.id, "endpoint_url": chat_url, "model": model, "default_provider": provider}
         finally:
             db.close()
 
