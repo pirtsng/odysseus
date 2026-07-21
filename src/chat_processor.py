@@ -317,14 +317,47 @@ class ChatProcessor:
 
         # Add web search if enabled
         web_sources = []
+        # For aggregator endpoints with native search, skip app-side web search
+        # so the provider handles search natively.
+        _skip_app_search = False
         if use_web:
+            _ep_url = getattr(session, "endpoint_url", None) or ""
+            _model_id = getattr(session, "model", None) or ""
+            try:
+                from src.llm_core import _configured_endpoint_kind
+                if _configured_endpoint_kind(_ep_url) in ("api", "proxy"):
+                    from core.database import SessionLocal, ModelEndpoint
+                    _db = SessionLocal()
+                    try:
+                        _ep = _db.query(ModelEndpoint).filter(
+                            ModelEndpoint.base_url == _ep_url, ModelEndpoint.is_enabled == True
+                        ).first()
+                        if _ep and _ep.cached_models:
+                            import json as _json
+                            _cached = _json.loads(_ep.cached_models)
+                            _models = _cached.get("data", []) if isinstance(_cached, dict) else []
+                            for _m in _models:
+                                if _m.get("id") == _model_id:
+                                    for _p in _m.get("providers", []):
+                                        if _p.get("supports_native_web_search"):
+                                            _skip_app_search = True
+                                            break
+                                    break
+                    finally:
+                        _db.close()
+            except Exception:
+                pass
+        if use_web and not _skip_app_search:
             try:
                 from src.llm_core import llm_call
 
                 t_url, t_model, t_headers = session.endpoint_url, session.model, session.headers
 
-                # Default fallback is the first non-empty line of the original user message
-                fallback_query = next((line.strip() for line in message.split("\n") if line.strip()), "")
+                # Default fallback: truncate to 100 chars and strip conversational prefixes
+                _raw_fallback = next((line.strip() for line in message.split("\n") if line.strip()), "")
+                import re as _re
+                _raw_fallback = _re.sub(r"^(Hey[,!]?\s*|Can you\s+|I was wondering\s+|I'd like to\s+|Could you\s+)", "", _raw_fallback, flags=_re.IGNORECASE)
+                fallback_query = _raw_fallback[:100]
                 search_query = fallback_query
 
                 try:
@@ -336,7 +369,17 @@ class ChatProcessor:
                                 "role": "system",
                                 "content": (
                                     "Extract a concise search query from the user's message. "
-                                    "Reply ONLY with the query."
+                                    "Preserve proper nouns, technical terms, dates, and temporal qualifiers "
+                                    '(e.g., "latest", "current", "2024"). Keep the original intent — if '
+                                    'the user asks "what is X", the query should be "X" or "what is X", '
+                                    "not a rephrased statement. Examples:\n"
+                                    'User: "What\'s the latest news about the Odysseus project?"\n'
+                                    "Query: Odysseus project latest news\n"
+                                    'User: "Can you tell me about GPT-4\'s context window?"\n'
+                                    "Query: GPT-4 context window\n"
+                                    'User: "How do I fix a segmentation fault in Python?"\n'
+                                    "Query: fix segmentation fault Python\n"
+                                    "Reply ONLY with the query, nothing else."
                                 ),
                             },
                             {"role": "user", "content": message},

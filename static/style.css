@@ -3043,6 +3043,7 @@ body.bg-pattern-sparkles {
     .model-picker-list {
       max-height: min(280px, 50dvh);
       overflow-y: auto;
+      overflow-x: hidden;
     }
     .model-picker-list.is-empty {
       max-height: 0;
@@ -3258,18 +3259,29 @@ body.bg-pattern-sparkles {
       flex: 0 0 auto;
       font-weight: 500;
       min-width: 80px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .model-picker-list .mp-provider-row .mp-provider-info {
       flex: 1 1 auto;
+      min-width: 0;
       opacity: 0.6;
       font-size: 0.92em;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .model-picker-list .mp-provider-row .mp-provider-price {
       flex: 0 0 auto;
+      min-width: 0;
       opacity: 0.7;
       font-size: 0.92em;
       text-align: right;
       font-variant-numeric: tabular-nums;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     /* Overflow "+" menu */
     .overflow-wrapper {

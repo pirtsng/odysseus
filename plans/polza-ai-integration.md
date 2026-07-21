@@ -434,3 +434,131 @@ if (data.type === "usage") {
 - OpenAI, Anthropic, Groq, etc. presets: continue working as before
 - `cost_rub` display: only appears when the field is present (aggregator endpoints). Existing endpoints see no change.
 - All other functionality: completely unaffected
+
+---
+
+## Bug Fixes (post-merge)
+
+After merging upstream changes, four bugs were identified and fixed in the polza.ai integration:
+
+### Bug Fix 1 — Vision models not working with aggregator endpoints
+
+**File**: `src/chat_helpers.py:159`
+**Lines changed**: +8
+
+**Problem**: [`model_supports_vision()`](src/chat_helpers.py:159) uses name-based keyword matching via [`is_vision_model()`](src/chat_helpers.py:70). Many polza.ai vision models (e.g., `z-ai/glm-5.2`) don't match any keyword in [`_VISION_MODEL_KEYWORDS`](src/chat_helpers.py:43). This causes `main_is_vision = False` in [`chat_handler.py`](src/chat_handler.py:209), which triggers image stripping at line 299 — converting the properly-formatted `[{type: "text"}, {type: "image_url"}]` content array into plain text, discarding all image data.
+
+**Solution**: Added a check in `model_supports_vision()`: when the endpoint is an aggregator (`endpoint_kind` is `"api"` or `"proxy"`), return `True` — aggregator endpoints handle vision support server-side. The model list already comes from the provider's `/v1/models` which only returns models the provider actually supports.
+
+```python
+# Aggregator endpoints (Polza.ai, OpenRouter, etc.) handle vision
+# server-side — their /v1/models only returns models they support
+try:
+    from src.model_context import _configured_endpoint_kind
+    if _configured_endpoint_kind(endpoint_url) in ("api", "proxy"):
+        return True
+except Exception:
+    pass
+```
+
+**Result**: Vision models on aggregator endpoints now correctly pass images through without stripping.
+
+---
+
+### Bug Fix 2 — Subprovider row overflow in model picker
+
+**File**: `static/style.css:3257-3273`
+**Lines changed**: +12
+
+**Problem**: The three flex children of `.mp-provider-row` had zero truncation CSS — no `overflow: hidden`, `text-overflow: ellipsis`, or `white-space: nowrap`. `.mp-provider-info` had `flex: 1 1 auto` but without `min-width: 0`, it couldn't shrink below its intrinsic content width. Long provider names like "openrouter" plus "128K ctx · 16K max" plus "130.53 / 410.23 ₽/M" overflowed the 360px dropdown.
+
+**Solution**: Added truncation CSS to all three sub-row children:
+```css
+.model-picker-list .mp-provider-row .mp-provider-name {
+  /* ... existing ... */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-picker-list .mp-provider-row .mp-provider-info {
+  /* ... existing ... */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-picker-list .mp-provider-row .mp-provider-price {
+  /* ... existing ... */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+```
+
+Also added `overflow-x: hidden` to `.model-picker-list` as a safety net.
+
+**Result**: Sub-provider rows now truncate with ellipsis instead of overflowing, matching the existing `.mp-model-name` behavior.
+
+---
+
+### Bug Fix 3 — Web search conflict between app and provider
+
+**Files**: `src/llm_core.py:2216` + `src/chat_processor.py:322`
+**Lines changed**: ~55
+
+**Problem**: polza.ai returns `supports_native_web_search: true` for some models, but the app had zero awareness of this field. The app injected its own web search results via [`chat_processor.py:318`](src/chat_processor.py:318) `build_context_preface()` and sent web search tool definitions via [`llm_core.py:2216`](src/llm_core.py:2216). Both the app and the provider performed web search simultaneously, causing conflicting/duplicate results.
+
+**Solution**:
+- **Part A** (`src/llm_core.py`): Before sending tool definitions, checks the model's cached provider data for `supports_native_web_search`. If found, filters `web_search`/`web_fetch` out of the tools list sent to the provider.
+- **Part B** (`src/chat_processor.py`): In `build_context_preface()`, checks the model's cached provider data for `supports_native_web_search`. If found, skips the app's `comprehensive_web_search()` call entirely.
+
+Both parts query the `ModelEndpoint` table's `cached_models` JSON blob and iterate the model's providers looking for `supports_native_web_search`.
+
+**Result**: When a model has native web search, the app stays out of the way and lets the provider handle search. No more duplicate/conflicting search results.
+
+---
+
+### Bug Fix 4 — Irrelevant search results from poor query extraction
+
+**File**: `src/chat_processor.py:356-383`
+**Lines changed**: ~25
+
+**Problem**: The LLM prompt for extracting search queries was a single line: `"Extract a concise search query from the user's message. Reply ONLY with the query."` — with no guidance on preserving search intent, no examples, and a fallback that used the first line of the user message directly (e.g., "Hey, can you help me with something?" → search query). This produced poor queries that led to irrelevant results.
+
+Root causes identified:
+1. **LLM query extraction**: Minimal prompt with no examples, no guidance on preserving entities, temporal qualifiers, or intent
+2. **Fallback logic**: Used the first non-empty line of the user message verbatim, including conversational prefixes
+
+**Solution**:
+1. Replaced the minimal prompt with a detailed prompt including 3 concrete examples:
+```
+Extract a concise search query from the user's message. Preserve proper nouns, technical terms,
+dates, and temporal qualifiers (e.g., "latest", "current", "2024"). Keep the original intent —
+if the user asks "what is X", the query should be "X" or "what is X", not a rephrased statement.
+Examples:
+User: "What's the latest news about the Odysseus project?"
+Query: Odysseus project latest news
+User: "Can you tell me about GPT-4's context window?"
+Query: GPT-4 context window
+User: "How do I fix a segmentation fault in Python?"
+Query: fix segmentation fault Python
+Reply ONLY with the query, nothing else.
+```
+
+2. Improved fallback logic to strip conversational prefixes (`"Hey, "`, `"Can you "`, `"I was wondering "`, `"I'd like to "`, `"Could you "`) and truncate to 100 characters.
+
+**Result**: Better search queries that preserve original intent, leading to more relevant results.
+
+---
+
+## Updated Summary
+
+| # | File | Lines | What changes |
+|---|---|---|---|
+| BF1 | `src/chat_helpers.py:159` | +8 | Aggregator endpoint vision support check |
+| BF2 | `static/style.css:3257-3273` | +12 | Sub-provider row truncation CSS |
+| BF3a | `src/llm_core.py:2216` | +25 | Native search detection + tool filtering |
+| BF3b | `src/chat_processor.py:322` | +30 | Native search bypass in context preface |
+| BF4 | `src/chat_processor.py:356-383` | +25 | Improved search query extraction prompt + fallback |
+| **Total bug fixes** | | **~100 lines across 4 files** | |

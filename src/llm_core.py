@@ -2164,6 +2164,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
       - event: error                       — errors
       - data: [DONE]                       — end of stream
     """
+    from src.model_context import _configured_endpoint_kind
     provider = _detect_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
 
@@ -2213,7 +2214,35 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        # For aggregator endpoints with native search, skip app-side web search tools
+        # so the provider handles search natively.
+        _skip_app_search = False
+        if _configured_endpoint_kind(url) in ("api", "proxy"):
+            try:
+                from core.database import SessionLocal, ModelEndpoint
+                db = SessionLocal()
+                try:
+                    ep = db.query(ModelEndpoint).filter(
+                        ModelEndpoint.base_url == url, ModelEndpoint.is_enabled == True
+                    ).first()
+                    if ep and ep.cached_models:
+                        import json as _json
+                        cached = _json.loads(ep.cached_models)
+                        models = cached.get("data", []) if isinstance(cached, dict) else []
+                        for m in models:
+                            if m.get("id") == model:
+                                for p in m.get("providers", []):
+                                    if p.get("supports_native_web_search"):
+                                        _skip_app_search = True
+                                        break
+                                break
+                finally:
+                    db.close()
+            except Exception:
+                pass
         if tools:
+            if _skip_app_search:
+                tools = [t for t in tools if t.get("function", {}).get("name") not in ("web_search", "web_fetch")]
             payload["tools"] = tools
         elif tool_choice_none:
             payload["tool_choice"] = "none"

@@ -167,6 +167,14 @@ def model_supports_vision(model_name: str, endpoint_url: str = "") -> bool:
             advertised = None
         if advertised is not None:
             return advertised
+    # Aggregator endpoints (Polza.ai, OpenRouter, etc.) handle vision
+    # server-side — their /v1/models only returns models they support
+    try:
+        from src.model_context import _configured_endpoint_kind
+        if _configured_endpoint_kind(endpoint_url) in ("api", "proxy"):
+            return True
+    except Exception:
+        pass
     return is_vision_model(model_name)
 
 
