@@ -305,6 +305,43 @@ function _fillModelSelect(selectEl, models, selected, keepBlank) {
   _syncModelLogo(selectEl);
 }
 
+// Shared: populate the provider dropdown when the selected endpoint is an aggregator.
+// Filters providers to only those available for the currently selected model.
+// If epSel is null, searches all endpoints for the model (used by Vision/Image
+// sections that lack an endpoint dropdown).
+function _refreshProviderDropdown(epSel, modelSel, provSel, provRow, endpoints, selectedProvider) {
+  var eps = epSel ? [endpoints.find(function(e) { return e.id === epSel.value; })] : endpoints;
+  var providers = [];
+  var currentModel = modelSel.value;
+  if (currentModel) {
+    eps.forEach(function(ep) {
+      if (!ep || !ep.cached_models) return;
+      try {
+        var parsed = typeof ep.cached_models === 'string' ? JSON.parse(ep.cached_models) : ep.cached_models;
+        if (parsed && Array.isArray(parsed.data)) {
+          var found = parsed.data.find(function(m) { return m.id === currentModel; });
+          if (found && Array.isArray(found.providers)) {
+            found.providers.forEach(function(p) {
+              if (p && p.name && providers.indexOf(p.name) === -1) {
+                providers.push(p.name);
+              }
+            });
+          }
+        }
+      } catch (_e) { /* not aggregator JSON */ }
+    });
+  }
+  if (providers.length > 0) {
+    provSel.innerHTML = '<option value="">— Auto —</option>'
+      + providers.map(function(p) { return '<option value="' + p.replace(/"/g, '"') + '">' + esc(p) + '</option>'; }).join('');
+    if (selectedProvider) provSel.value = selectedProvider;
+    provRow.style.display = '';
+  } else {
+    provRow.style.display = 'none';
+    provSel.innerHTML = '';
+  }
+}
+
 function _registerAiEndpointRefresh(fn) {
   _aiEndpointRefreshers.add(fn);
 }
@@ -454,10 +491,18 @@ async function initDefaultChat() {
     return _endpoints.filter(function(e) { return e.is_enabled; });
   }
 
+  var provRow = el('set-defaultProviderRow');
+  var provSel = el('set-defaultProviderSelect');
+
   // Fill any <select> with the models for a given endpoint id.
   function fillModels(selectEl, epId, selected) {
     var ep = _endpoints.find(function(e) { return e.id === epId; });
     _fillModelSelect(selectEl, ep ? ep.models : [], selected, false);
+  }
+
+  // Populate the provider dropdown when the selected endpoint is an aggregator.
+  function refreshProviders(selectedProvider) {
+    _refreshProviderDropdown(epSel, modelSel, provSel, provRow, _endpoints, selectedProvider);
   }
 
   try {
@@ -469,6 +514,7 @@ async function initDefaultChat() {
   function refreshEndpointOptions(selectedEndpoint, selectedModel) {
     _fillEndpointSelect(epSel, _endpoints, selectedEndpoint !== undefined ? selectedEndpoint : epSel.value, false);
     refreshModels(selectedModel !== undefined ? selectedModel : modelSel.value);
+    refreshProviders(provSel.value);
     renderFallbacks();
   }
 
@@ -534,6 +580,7 @@ async function initDefaultChat() {
     var settings = await res.json();
     if (settings.default_endpoint_id) epSel.value = settings.default_endpoint_id;
     refreshModels(settings.default_model || '');
+    refreshProviders(settings.default_provider || '');
     _fallbacks = Array.isArray(settings.default_model_fallbacks)
       ? settings.default_model_fallbacks.map(function(f) {
           return { endpoint_id: (f && f.endpoint_id) || '', model: (f && f.model) || '' };
@@ -553,6 +600,7 @@ async function initDefaultChat() {
         body: JSON.stringify({
           default_endpoint_id: epSel.value,
           default_model: modelSel.value,
+          default_provider: provSel.value,
           default_model_fallbacks: clean
         })
       });
@@ -561,6 +609,9 @@ async function initDefaultChat() {
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
+  epSel.addEventListener('change', function() { refreshModels(''); refreshProviders(''); saveDefault(); });
+  modelSel.addEventListener('change', function() { refreshProviders(provSel.value); saveDefault(); });
+  provSel.addEventListener('change', saveDefault);
   if (addFbBtn) addFbBtn.addEventListener('click', function() {
     var first = enabledEndpoints()[0];
     _fallbacks.push({ endpoint_id: first ? first.id : '', model: '' });
@@ -581,6 +632,8 @@ async function initUtilityModel() {
   var msg = el('set-utilityChatMsg');
   var _endpoints = [];
   var fallbackWidget = null;
+  var provRow = el('set-utilityProviderRow');
+  var provSel = el('set-utilityProviderSelect');
   if (epSel && epSel.options[0]) epSel.options[0].textContent = 'Same as chat';
   if (modelSel && modelSel.options[0]) modelSel.options[0].textContent = 'Same as chat';
 
@@ -595,11 +648,16 @@ async function initUtilityModel() {
     _fillModelSelect(modelSel, ep ? ep.models : [], selectedModel, true);
   }
 
+  function refreshProviders(selectedProvider) {
+    _refreshProviderDropdown(epSel, modelSel, provSel, provRow, _endpoints, selectedProvider);
+  }
+
   try {
     var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
     var settings = await res.json();
     if (settings.utility_endpoint_id) epSel.value = settings.utility_endpoint_id;
     refreshModels(settings.utility_model || '');
+    refreshProviders(settings.utility_provider || '');
     fallbackWidget = _bindFallbackWidget({
       containerId: 'set-utilityFallbacks',
       addBtnId: 'set-utilityAddFallback',
@@ -620,7 +678,8 @@ async function initUtilityModel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           utility_endpoint_id: epSel.value || '',
-          utility_model: modelSel.value || ''
+          utility_model: modelSel.value || '',
+          utility_provider: provSel.value || ''
         })
       });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
@@ -628,13 +687,15 @@ async function initUtilityModel() {
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
-  epSel.addEventListener('change', function() { refreshModels(''); saveUtility(); });
-  modelSel.addEventListener('change', saveUtility);
+  epSel.addEventListener('change', function() { refreshModels(''); refreshProviders(''); saveUtility(); });
+  modelSel.addEventListener('change', function() { refreshProviders(provSel.value); saveUtility(); });
+  provSel.addEventListener('change', saveUtility);
 
   _registerAiEndpointRefresh(function(endpoints) {
     _endpoints = endpoints;
     _fillEndpointSelect(epSel, _endpoints, epSel.value, true);
     refreshModels(modelSel.value);
+    refreshProviders(provSel.value);
     if (fallbackWidget && fallbackWidget.refresh) fallbackWidget.refresh();
   });
 }
@@ -747,6 +808,9 @@ async function initImageSettings() {
   const msg = el('set-imgSettingsMsg');
   const enabledToggle = el('set-imgEnabledToggle');
   const configWrap = modelSel ? modelSel.closest('div[style*="flex-direction"]') : null;
+  var _imageEndpoints = [];
+  var imgProvRow = el('set-imageProviderRow');
+  var imgProvSel = el('set-imageProviderSelect');
   try {
     const modelsRes = await fetch('/api/models', { credentials: 'same-origin' });
     const modelsData = await modelsRes.json();
@@ -775,9 +839,18 @@ async function initImageSettings() {
     });
   } catch (e) { console.warn('Failed to load models for image settings', e); }
   try {
+    _imageEndpoints = await _fetchModelEndpoints();
+  } catch (e) { console.warn('Failed to load endpoints for image provider', e); }
+
+  function refreshProviders(selectedProvider) {
+    _refreshProviderDropdown(null, modelSel, imgProvSel, imgProvRow, _imageEndpoints, selectedProvider);
+  }
+
+  try {
     const settingsRes = await fetch('/api/auth/settings', { credentials: 'same-origin' });
     const settings = await settingsRes.json();
     if (settings.image_model) modelSel.value = settings.image_model;
+    refreshProviders(settings.image_provider || '');
     if (settings.image_quality) qualSel.value = settings.image_quality;
     if (enabledToggle) enabledToggle.checked = settings.image_gen_enabled === true;
   } catch (e) { console.warn('Failed to load settings', e); }
@@ -793,11 +866,12 @@ async function initImageSettings() {
   async function saveSettings() {
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image_gen_enabled: enabledToggle ? enabledToggle.checked : false, image_model: modelSel.value, image_quality: qualSel.value }) });
+        body: JSON.stringify({ image_gen_enabled: enabledToggle ? enabledToggle.checked : false, image_model: modelSel.value, image_provider: imgProvSel.value || '', image_quality: qualSel.value }) });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)'; setTimeout(() => { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
-  modelSel.addEventListener('change', saveSettings);
+  modelSel.addEventListener('change', function() { refreshProviders(imgProvSel.value); saveSettings(); });
+  imgProvSel.addEventListener('change', saveSettings);
   qualSel.addEventListener('change', saveSettings);
   if (enabledToggle) enabledToggle.addEventListener('change', function() { syncImgDisabled(); saveSettings(); });
 }
@@ -810,6 +884,8 @@ async function initVisionSettings() {
   const configWrap = vlSel ? vlSel.closest('div[style*="flex-direction"]') : null;
   var _visionEndpoints = [];
   var visionFallbackWidget = null;
+  var visProvRow = el('set-visionProviderRow');
+  var visProvSel = el('set-visionProviderSelect');
   var _vlExclude = ['audio', 'realtime', 'tts', 'dall-e', 'embedding', 'search', 'whisper'];
   function _isVisionModel(mid) {
     var lower = String(mid || '').toLowerCase();
@@ -836,11 +912,17 @@ async function initVisionSettings() {
   try {
     _visionEndpoints = await _fetchModelEndpoints();
   } catch (e) { console.warn('Failed to load endpoints for vision fallback', e); }
+
+  function refreshProviders(selectedProvider) {
+    _refreshProviderDropdown(null, vlSel, visProvSel, visProvRow, _visionEndpoints, selectedProvider);
+  }
+
   try {
     const settingsRes = await fetch('/api/auth/settings', { credentials: 'same-origin' });
     const settings = await settingsRes.json();
     if (settings.vision_model) vlSel.value = settings.vision_model;
     _syncModelLogo(vlSel);
+    refreshProviders(settings.vision_provider || '');
     if (enabledToggle) enabledToggle.checked = settings.vision_enabled !== false;
     visionFallbackWidget = _bindFallbackWidget({
       containerId: 'set-visionFallbacks',
@@ -867,11 +949,12 @@ async function initVisionSettings() {
   async function saveSettings() {
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ vision_enabled: enabledToggle ? enabledToggle.checked : true, vision_model: vlSel.value }) });
+        body: JSON.stringify({ vision_enabled: enabledToggle ? enabledToggle.checked : true, vision_model: vlSel.value, vision_provider: visProvSel.value || '' }) });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)'; setTimeout(() => { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
-  vlSel.addEventListener('change', saveSettings);
+  vlSel.addEventListener('change', function() { refreshProviders(visProvSel.value); saveSettings(); });
+  visProvSel.addEventListener('change', saveSettings);
   if (enabledToggle) enabledToggle.addEventListener('change', function() { syncVisionDisabled(); saveSettings(); });
 
   _registerAiEndpointRefresh(function(endpoints) {
@@ -1515,6 +1598,8 @@ async function initResearchSettings() {
   var runTimeoutInput = el('set-researchRunTimeout');
   var msg = el('set-researchMsg');
   var endpoints = [];
+  var provRow = el('set-researchProviderRow');
+  var provSel = el('set-researchProviderSelect');
 
   try {
     endpoints = await _fetchModelEndpoints();
@@ -1527,11 +1612,16 @@ async function initResearchSettings() {
     _fillModelSelect(modelSel, ep ? ep.models : [], selectedModel, true);
   }
 
+  function refreshProviders(selectedProvider) {
+    _refreshProviderDropdown(epSel, modelSel, provSel, provRow, endpoints, selectedProvider);
+  }
+
   try {
     var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
     var settings = await res.json();
     if (settings.research_endpoint_id) epSel.value = settings.research_endpoint_id;
     refreshModels(settings.research_model || '');
+    refreshProviders(settings.research_provider || '');
     if (settings.research_max_tokens) tokensInput.value = settings.research_max_tokens;
     if (settings.research_extraction_timeout_seconds) extractTimeoutInput.value = settings.research_extraction_timeout_seconds;
     if (settings.research_extraction_concurrency) extractConcurrencyInput.value = settings.research_extraction_concurrency;
@@ -1576,6 +1666,7 @@ async function initResearchSettings() {
     var payload = {
       research_endpoint_id: epSel.value,
       research_model: modelSel.value,
+      research_provider: provSel.value || '',
     };
     var tv = parseInt(tokensInput.value, 10);
     if (tv && tv >= 1024) payload.research_max_tokens = tv;
@@ -1602,9 +1693,11 @@ async function initResearchSettings() {
 
   epSel.addEventListener('change', async function() {
     refreshModels('');
+    refreshProviders('');
     saveResearch();
   });
-  modelSel.addEventListener('change', saveResearch);
+  modelSel.addEventListener('change', function() { refreshProviders(provSel.value); saveResearch(); });
+  provSel.addEventListener('change', saveResearch);
   tokensInput.addEventListener('change', saveResearch);
   extractTimeoutInput.addEventListener('change', saveResearch);
   extractConcurrencyInput.addEventListener('change', saveResearch);
@@ -1614,6 +1707,7 @@ async function initResearchSettings() {
     endpoints = nextEndpoints;
     _fillEndpointSelect(epSel, endpoints, epSel.value, true);
     refreshModels(modelSel.value);
+    refreshProviders(provSel.value);
   });
 }
 
@@ -3106,6 +3200,28 @@ async function initEmailSettings() {
   const root = el('settings-modal');
   if (!root || !root.querySelector('[data-settings-panel="email"]')) return;
 
+  const styleKey = 'odysseus-email-writing-style';
+  const styleEl = el('set-email-style');
+
+  // The account/CardDAV config endpoints can be slow when remote mail servers
+  // are cold. Populate the Writing Style box independently so saved prose does
+  // not appear seconds after the panel opens.
+  try {
+    const cachedStyle = localStorage.getItem(styleKey);
+    if (styleEl && cachedStyle !== null && !styleEl.value) styleEl.value = cachedStyle;
+  } catch (_) {}
+
+  const loadWritingStyle = async () => {
+    try {
+      const res = await fetch('/api/email/style');
+      const data = await res.json();
+      const style = data.style || '';
+      if (styleEl) styleEl.value = style;
+      try { localStorage.setItem(styleKey, style); } catch (_) {}
+    } catch (_) {}
+  };
+  loadWritingStyle();
+
   // Load current email config
   try {
     const res = await fetch('/api/email/config');
@@ -3119,8 +3235,6 @@ async function initEmailSettings() {
     if (el('set-email-smtp-user')) el('set-email-smtp-user').value = cfg.smtp_user || '';
     if (el('set-email-smtp-pass')) el('set-email-smtp-pass').value = '';
     if (el('set-email-from')) el('set-email-from').value = cfg.from_address || '';
-    if (el('set-email-auto-translate')) el('set-email-auto-translate').checked = !!cfg.email_auto_translate;
-    if (el('set-email-translate-language')) el('set-email-translate-language').value = cfg.email_translate_language || 'English';
   } catch (_) {}
 
   // Load contacts config
@@ -3130,13 +3244,6 @@ async function initEmailSettings() {
     if (el('set-carddav-url')) el('set-carddav-url').value = cfg.url || '';
     if (el('set-carddav-user')) el('set-carddav-user').value = cfg.username || '';
     if (el('set-carddav-pass')) el('set-carddav-pass').value = '';
-  } catch (_) {}
-
-  // Load writing style
-  try {
-    const res = await fetch('/api/email/style');
-    const data = await res.json();
-    if (el('set-email-style')) el('set-email-style').value = data.style || '';
   } catch (_) {}
 
   // Save email config
@@ -3151,8 +3258,6 @@ async function initEmailSettings() {
       smtp_port: parseInt(el('set-email-smtp-port').value) || 0,
       smtp_user: el('set-email-smtp-user').value,
       email_from: el('set-email-from').value,
-      email_auto_translate: !!el('set-email-auto-translate')?.checked,
-      email_translate_language: (el('set-email-translate-language')?.value || 'English').trim() || 'English',
     };
     const imapPass = el('set-email-imap-pass').value;
     const smtpPass = el('set-email-smtp-pass').value;
@@ -3166,10 +3271,7 @@ async function initEmailSettings() {
       });
       const result = await res.json();
       if (msg) msg.textContent = result.success ? '✓ Saved' : (result.error || 'Failed');
-      const translateMsg = el('set-email-translate-msg');
-      if (translateMsg) translateMsg.textContent = result.success ? '✓ Saved' : (result.error || 'Failed');
       setTimeout(() => { if (msg) msg.textContent = ''; }, 3000);
-      setTimeout(() => { const translateMsg = el('set-email-translate-msg'); if (translateMsg) translateMsg.textContent = ''; }, 3000);
     } catch (e) {
       if (msg) msg.textContent = 'Failed';
     }
@@ -3234,7 +3336,8 @@ async function initEmailSettings() {
       });
       const data = await res.json();
       if (data.success && data.style) {
-        if (el('set-email-style')) el('set-email-style').value = data.style;
+        if (styleEl) styleEl.value = data.style;
+        try { localStorage.setItem(styleKey, data.style); } catch (_) {}
         if (msg) msg.textContent = '✓ Style extracted';
       } else {
         if (msg) msg.textContent = data.error || 'Failed';
@@ -3253,12 +3356,16 @@ async function initEmailSettings() {
     const msg = el('set-email-style-msg');
     if (msg) msg.textContent = 'Saving...';
     try {
+      const style = styleEl ? styleEl.value : '';
       const res = await fetch('/api/email/style', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ style: el('set-email-style').value }),
+        body: JSON.stringify({ style }),
       });
       const result = await res.json();
+      if (result.success) {
+        try { localStorage.setItem(styleKey, style); } catch (_) {}
+      }
       if (msg) msg.textContent = result.success ? '✓ Saved' : 'Failed';
       setTimeout(() => { if (msg) msg.textContent = ''; }, 3000);
     } catch (e) {

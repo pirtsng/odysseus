@@ -219,6 +219,28 @@ class ModelDiscovery:
         ports += [p for p in sorted(self._extra_ports) if p not in ports]
         targets = [(h, p) for h in hosts for p in ports]
 
+        # Skip hosts belonging to configured api/proxy endpoints (aggregators).
+        # These serve model lists through their own /v1/models API, not port scanning.
+        try:
+            from core.database import SessionLocal, ModelEndpoint
+            from urllib.parse import urlparse as _urlparse
+            db = SessionLocal()
+            try:
+                skip_hosts = {
+                    _urlparse(ep.base_url).hostname
+                    for ep in db.query(ModelEndpoint).filter(
+                        ModelEndpoint.is_enabled == True,
+                        ModelEndpoint.endpoint_kind.in_(["api", "proxy"])
+                    ).all()
+                    if ep.base_url
+                }
+            finally:
+                db.close()
+        except Exception:
+            skip_hosts = set()
+
+        targets = [(h, p) for h, p in targets if h not in skip_hosts]
+
         seen_models = (
             set()
         )  # dedupe by (port, model_ids) to avoid same machine via different IPs

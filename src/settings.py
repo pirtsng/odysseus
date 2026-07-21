@@ -39,8 +39,12 @@ DEFAULT_SETTINGS = {
     "agent_email_confirm": True,
     "image_gen_enabled": False,
     "image_model": "",
+    # Sub-provider preference for aggregator endpoints in Image Generation.
+    "image_provider": "",
     "image_quality": "medium",
     "vision_model": "",
+    # Sub-provider preference for aggregator endpoints in Vision model.
+    "vision_provider": "",
     "vision_enabled": True,
     # Ordered fallback chain for the Vision model (image analysis, OCR, tagging).
     "vision_model_fallbacks": [],
@@ -90,6 +94,8 @@ DEFAULT_SETTINGS = {
     "serper_api_key": "",
     "research_endpoint_id": "",
     "research_model": "",
+    # Sub-provider preference for aggregator endpoints in the Research model.
+    "research_provider": "",
     "research_search_provider": "",
     "research_max_tokens": 16384,
     "research_extraction_timeout_seconds": 90,
@@ -136,6 +142,11 @@ DEFAULT_SETTINGS = {
     "task_model": "",
     "default_endpoint_id": "",
     "default_model": "",
+    # Sub-provider preference for aggregator endpoints (Polza.ai, OpenRouter, etc.).
+    # When set, the backend injects provider: {only: [provider_name]} into the
+    # LLM request payload so the frontend's model picker provider selection is
+    # carried through automatically for the default chat model.
+    "default_provider": "",
     # Optional prose style used only for normal document writing/editing.
     # Email replies use email_writing_style instead because greetings,
     # signatures, and mailbox identity rules are medium-specific.
@@ -151,6 +162,8 @@ DEFAULT_SETTINGS = {
     "share_defaults_with_users": False,
     "utility_endpoint_id": "",
     "utility_model": "",
+    # Sub-provider preference for aggregator endpoints in the Utility model.
+    "utility_provider": "",
     # Ordered fallback chain for the Utility model (summarization, naming,
     # tidy actions, etc.).
     "utility_model_fallbacks": [],
@@ -267,14 +280,14 @@ def is_setting_overridden(key: str) -> bool:
 # model + image-generation model. The owner argument is the authed username
 # resolved by FastAPI deps; an empty/None owner falls through to the global.
 _PER_USER_KEYS = {
-    "vision_model", "vision_enabled", "vision_model_fallbacks",
-    "image_model", "image_gen_enabled", "image_quality",
+    "vision_model", "vision_provider", "vision_enabled", "vision_model_fallbacks",
+    "image_model", "image_provider", "image_gen_enabled", "image_quality",
     # Default chat endpoint / model — without per-user resolution every new
     # account inherited whatever the most-recent admin picked, which then
     # got injected into the chat composer on first open.
-    "default_endpoint_id", "default_model", "default_model_fallbacks",
-    "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
-    "research_endpoint_id", "research_model",
+    "default_endpoint_id", "default_model", "default_provider", "default_model_fallbacks",
+    "utility_endpoint_id", "utility_model", "utility_provider", "utility_model_fallbacks",
+    "research_endpoint_id", "research_model", "research_provider",
 }
 
 

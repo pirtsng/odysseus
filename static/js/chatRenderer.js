@@ -474,6 +474,10 @@ const XML_INVOKE_RE = /<invoke\s+name=['"][^'"]*['"]>[\s\S]*?<\/invoke>/gi;
 // (e.g. mid-stream before the closing tag arrives).
 const DSML_TOOL_RE = /<\s*[｜|]+\s*DSML\s*[｜|]+\s*tool_calls\s*>[\s\S]*?(?:<\s*\/\s*[｜|]+\s*DSML\s*[｜|]+\s*tool_calls\s*>|$)/gi;
 const DSML_STRAY_RE = /<\s*\/?\s*[｜|]+\s*DSML\s*[｜|]+[^>]*>/gi;
+const DSML_INVOKE_RE = /<\s*[｜|]+\s*DSML\s*[｜|]+\s*invoke\b[^>]*>[\s\S]*?(?:<\s*\/\s*[｜|]+\s*DSML\s*[｜|]+\s*invoke\s*>|$)/gi;
+const RAW_OPENAI_TOOL_JSON_RE = /(?:\[\s*)?\{\s*"function"\s*:\s*\{[\s\S]*?\}\s*,\s*"id"\s*:\s*"[^"]*"\s*,\s*"type"\s*:\s*"function"\s*\}\s*\]?/gi;
+const QWEN_ROLE_MARKER_RE = /<\/?\|(?:assistant|assistan|user|system|tool)\|>?|<\/\|end\|>?/gi;
+const QWEN_BARE_MARKER_RE = /(?:^|[\t\r\n ])(?:\|?end\|?|\/?\|end\|)(?=[\t\r\n ]|$)|(?:^|[\t\r\n ])assistan(?:t)?(?=[\t\r\n ]|$)/gi;
 // Self-narration about tool results (model echoing stdout/exit_code)
 const TOOL_NARRATION_RE = /(?:The (?:result|output) shows?:?\s*)?-?\s*(?:stdout|stderr|exit_code):\s*.+/gi;
 
@@ -911,9 +915,13 @@ export function stripToolBlocks(text) {
   let cleaned = text.replace(TOOL_CALL_RE, '');
   if (EXEC_FENCE_RE) cleaned = cleaned.replace(EXEC_FENCE_RE, stripExecutedFence);
   cleaned = cleaned.replace(DSML_TOOL_RE, '');
+  cleaned = cleaned.replace(DSML_INVOKE_RE, '');
   cleaned = cleaned.replace(DSML_STRAY_RE, '');
   cleaned = cleaned.replace(XML_TOOL_CALL_RE, '');
   cleaned = cleaned.replace(XML_INVOKE_RE, '');
+  cleaned = cleaned.replace(RAW_OPENAI_TOOL_JSON_RE, '');
+  cleaned = cleaned.replace(QWEN_ROLE_MARKER_RE, '');
+  cleaned = cleaned.replace(QWEN_BARE_MARKER_RE, ' ');
   cleaned = cleaned.replace(TOOL_NARRATION_RE, '');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
   return cleaned.trim();
@@ -1152,17 +1160,41 @@ document.addEventListener('click', function(e) {
   while (_t && _t.nodeType === Node.TEXT_NODE) _t = _t.parentElement;
   const a = _t && _t.closest && _t.closest('a[href]');
   if (!a) return;
-  const href = a.getAttribute('href') || '';
+  const rawHref = a.getAttribute('href') || '';
+  let href = rawHref;
+  try {
+    const parsed = new URL(rawHref, window.location.origin);
+    if (parsed.origin === window.location.origin && parsed.pathname === window.location.pathname) {
+      href = parsed.hash || rawHref;
+    }
+  } catch (_) {}
   if (!href.startsWith('#')) return;
-  const m = href.match(/^#(session|document|note|image|email|event|task|skill|research)-(.+)$/);
+  let m = href.match(/^#(session|document|note|image|email|event|task|skill|research)-(.+)$/);
+  if (!m) {
+    const noteOpen = href.match(/^#open=notes&note=([^&]+)/);
+    if (noteOpen) m = ['note', 'note', decodeURIComponent(noteOpen[1])];
+  }
+  if (!m) {
+    const bareSession = href.match(/^#([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    if (bareSession) m = ['session', 'session', bareSession[1]];
+  }
   if (!m) return;
   e.preventDefault();
   e.stopPropagation();
   const [, kind, id] = m;
   if (kind === 'session') {
+    try {
+      a.classList.add('is-loading');
+      a.setAttribute('aria-busy', 'true');
+    } catch {}
     import('./sessions.js').then(mod => {
       const fn = mod.selectSession || (mod.default && mod.default.selectSession);
-      if (fn) fn(id);
+      if (fn) return fn(id, { showLoading: true, immediateLoading: true });
+    }).finally(() => {
+      try {
+        a.classList.remove('is-loading');
+        a.removeAttribute('aria-busy');
+      } catch {}
     });
   } else if (kind === 'document') {
     import('./document.js').then(mod => {
@@ -1175,6 +1207,11 @@ document.addEventListener('click', function(e) {
     import('./notes.js').then(mod => {
       const open = mod.openNote || (mod.default && mod.default.openNote);
       if (open) open(id);
+      try {
+        if (/^#(?:note-|open=notes&note=)/.test(window.location.hash || '')) {
+          history.replaceState(null, '', window.location.pathname + window.location.search);
+        }
+      } catch (_) {}
     }).catch(() => {});
   } else if (kind === 'image') {
     import('./gallery.js').then(mod => {
@@ -1208,7 +1245,7 @@ document.addEventListener('click', function(e) {
       if (open) open(id);
     }).catch(() => {});
   }
-});
+}, true);
 
 /**
  * Build a generated-image bubble element.
@@ -1325,6 +1362,25 @@ export function buildImageBubble(imageUrl, prompt, model, size, quality, imageId
     }
   });
   actions.appendChild(editBtn);
+
+  if (imageId) {
+    const galleryBtn = document.createElement('button');
+    galleryBtn.className = 'footer-copy-btn footer-open-gallery-btn';
+    galleryBtn.type = 'button';
+    galleryBtn.title = 'Open in gallery';
+    galleryBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span>Open in gallery</span>';
+    galleryBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try {
+        const mod = await import('./gallery.js');
+        const open = mod.openGalleryImage || (mod.default && mod.default.openGalleryImage);
+        if (open) open(imageId);
+      } catch (err) {
+        console.error('[chat] open in gallery failed', err);
+      }
+    });
+    actions.appendChild(galleryBtn);
+  }
 
   const delBtn = document.createElement('button');
   delBtn.className = 'footer-copy-btn footer-delete-btn';
@@ -1772,9 +1828,11 @@ export function displayMetrics(messageElement, metrics) {
   const ctxPct = metrics.context_percent;
   const model = metrics.model || 'Unknown';
   const cost = _billableCost(model, inputTokens, outputTokens);
+  // cost_rub from aggregator endpoints (e.g. Polza.ai) — actual ruble cost
+  const costRub = metrics.cost_rub != null ? parseFloat(metrics.cost_rub) : null;
 
   // Nothing useful to show — bail out (only if ALL metrics are missing)
-  if (!responseTime && !inputTokens && !outputTokens && tps == null && !ctxPct) return;
+  if (!responseTime && !inputTokens && !outputTokens && tps == null && !ctxPct && costRub == null) return;
 
   // Accumulate session cost (only on fresh metrics, not history reload)
   if (!metrics._fromHistory) {
@@ -1787,11 +1845,20 @@ export function displayMetrics(messageElement, metrics) {
       } catch (_e) { /* ignore */ }
       updateSessionCostUI();
     }
+    // Also track actual ruble cost from aggregator endpoints
+    if (_sid && costRub != null) {
+      try {
+        const _rubCosts = JSON.parse(localStorage.getItem(_COST_KEY + '-rub') || '{}');
+        _rubCosts[_sid] = (_rubCosts[_sid] || 0) + costRub;
+        localStorage.setItem(_COST_KEY + '-rub', JSON.stringify(_rubCosts));
+      } catch (_e) { /* ignore */ }
+    }
   }
 
-  // Default: show tok/s if available, else fall back to other stats
+  // Keep token counts in the Message Stats popup; the footer should stay slim.
   const costStr0 = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : null;
-  const metricsLabel = tps != null && tps !== 'undefined'
+  const costRubStr = costRub != null ? `${costRub.toFixed(4)} ₽` : null;
+  let metricsLabel = tps != null && tps !== 'undefined'
     ? `${tps} tok/s`
     : costStr0
       ? `${outputTokens} tok · ${costStr0}`
@@ -1802,6 +1869,14 @@ export function displayMetrics(messageElement, metrics) {
           : responseTime != null
             ? `${responseTime}s`
             : '';
+  // Append actual ruble cost when available (overrides computed USD cost display)
+  if (costRubStr) {
+    if (metricsLabel) {
+      metricsLabel += ` · ${costRubStr}`;
+    } else {
+      metricsLabel = costRubStr;
+    }
+  }
   if (!metricsLabel) return;
   metricsContainer.textContent = metricsLabel;
   metricsContainer.style.cursor = 'pointer';
@@ -1816,7 +1891,9 @@ export function displayMetrics(messageElement, metrics) {
     document.querySelectorAll('.ctx-popup').forEach(p => { if (typeof p._dismiss === 'function') p._dismiss(); else p.remove(); });
 
     const costStr = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : '';
+    const costRubStr = costRub != null ? `${costRub.toFixed(4)} ₽` : '';
     const costRows = costStr ? `<div><span class="ctx-label">Cost</span> ${costStr}</div>` : '';
+    const costRubRow = costRubStr ? `<div><span class="ctx-label">Cost (₽)</span> ${costRubStr}</div>` : '';
     const speedStr = tps != null && tps !== 'undefined' ? `${tps} tok/s` : 'n/a';
     const totalTok = inputTokens + outputTokens;
     const ctxColor = ctxPct >= 85 ? 'var(--red, #e06c75)' : ctxPct >= 70 ? '#ff9900' : 'var(--color-muted-alt, #6b7280)';
@@ -1833,6 +1910,18 @@ export function displayMetrics(messageElement, metrics) {
     if (costStr && sc > 0) {
       sessionCostStr = `<div><span class="ctx-label">Session</span> $${sc < 0.01 ? sc.toFixed(4) : sc.toFixed(3)}</div>`;
     }
+    // Session total in rubles (for aggregator endpoints)
+    let sessionCostRubStr = '';
+    if (costRubStr) {
+      try {
+        const _rubCosts = JSON.parse(localStorage.getItem(_COST_KEY + '-rub') || '{}');
+        const _sid = window.sessionModule && window.sessionModule.getCurrentSessionId();
+        const totalRub = _sid ? (_rubCosts[_sid] || 0) : 0;
+        if (totalRub > 0) {
+          sessionCostRubStr = `<div><span class="ctx-label">Session (₽)</span> ${totalRub.toFixed(4)} ₽</div>`;
+        }
+      } catch (_e) { /* ignore */ }
+    }
 
     const popup = document.createElement('div');
     popup.className = 'ctx-popup';
@@ -1847,7 +1936,9 @@ export function displayMetrics(messageElement, metrics) {
       ${prepTime != null ? `<div><span class="ctx-label">Prep</span> ${prepTime}s</div>` : ''}
       ${modelWaitTime != null ? `<div><span class="ctx-label">Model wait</span> ${modelWaitTime}s</div>` : ''}
       ${costRows}
+      ${costRubRow}
       ${sessionCostStr}
+      ${sessionCostRubStr}
       ${prepDetails ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border);font-size:0.85em;opacity:0.8;">
         <div style="font-weight:600;margin-bottom:4px;color:var(--fg);">Agent prep</div>
         ${prepDetails}
@@ -2442,8 +2533,8 @@ export function addMessage(role, content, modelName, metadata) {
         .trim();
     }
 
-    wrap.dataset.raw = text;
-    if (metadata?._db_id) wrap.dataset.dbId = metadata._db_id;
+	    wrap.dataset.raw = text;
+	    if (metadata?._db_id) wrap.dataset.dbId = metadata._db_id;
     // Prepend sources box if saved in metadata
     var sourcesPrefix = '';
     var findingsSuffix = '';
@@ -2466,9 +2557,10 @@ export function addMessage(role, content, modelName, metadata) {
         '<think' + (thinkTime ? ` time="${thinkTime}"` : '') + '>' + metadata.thinking + '</think>\n\n' + text
       );
       b.innerHTML = sourcesPrefix + thinkHtml + findingsSuffix;
-    } else {
-      b.innerHTML = sourcesPrefix + markdownModule.processWithThinking(text) + findingsSuffix;
-    }
+	    } else {
+	      b.innerHTML = sourcesPrefix + markdownModule.processWithThinking(text) + findingsSuffix;
+	    }
+	    b.dataset.raw = text;
 
     // The vision/OCR caption is stripped from the displayed text above (so the
     // bubble doesn't show the raw model output) but no longer rendered as an

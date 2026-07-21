@@ -128,25 +128,35 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
                 if matched:
                     return build_chat_url(base), matched, headers
             else:
-                # OpenAI-compatible and native Ollama: probe the provider's model list.
-                try:
-                    models_url = build_models_url(base)
-                    if models_url:
-                        r = httpx.get(models_url, headers=headers, timeout=5)
-                        r.raise_for_status()
-                        data = r.json()
-                        items = data if isinstance(data, list) else (data.get("data") or [])
-                        model_ids = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
-                        if not model_ids:
-                            model_ids = [
-                                m.get("name") or m.get("model")
-                                for m in (data.get("models") or [])
-                                if m.get("name") or m.get("model")
-                            ]
-                    else:
-                        model_ids = json.loads(ep.cached_models or "[]")
-                except Exception:
-                    model_ids = []
+                from src.model_context import _configured_endpoint_kind
+                if _configured_endpoint_kind(base) in ("api", "proxy"):
+                    # Aggregator: trust model exists (populated by auto-refresh).
+                    # cached_models contains the full JSON response with providers[],
+                    # so extract model IDs from the "data" array.
+                    import json as _json
+                    model_ids = _json.loads(ep.cached_models or "[]")
+                    if isinstance(model_ids, dict) and "data" in model_ids:
+                        model_ids = [m["id"] for m in model_ids.get("data", [])]
+                else:
+                    # OpenAI-compatible and native Ollama: probe the provider's model list.
+                    try:
+                        models_url = build_models_url(base)
+                        if models_url:
+                            r = httpx.get(models_url, headers=headers, timeout=5)
+                            r.raise_for_status()
+                            data = r.json()
+                            items = data if isinstance(data, list) else (data.get("data") or [])
+                            model_ids = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
+                            if not model_ids:
+                                model_ids = [
+                                    m.get("name") or m.get("model")
+                                    for m in (data.get("models") or [])
+                                    if m.get("name") or m.get("model")
+                                ]
+                        else:
+                            model_ids = json.loads(ep.cached_models or "[]")
+                    except Exception:
+                        model_ids = []
 
                 # Exact match first
                 for mid in model_ids:

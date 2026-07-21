@@ -471,7 +471,7 @@ async function loadEndpoints() {
   const listLegacy = el('adm-epList');
   // Refresh model picker so new endpoints show up in chat
   if (window.modelsModule && window.modelsModule.refreshModels) {
-    window.modelsModule.refreshModels();
+    window.modelsModule.refreshModels(true);
     setTimeout(() => {
       if (window.sessionModule && window.sessionModule.updateModelPicker) {
         window.sessionModule.updateModelPicker();
@@ -934,6 +934,13 @@ function initEndpointForm() {
   function _apiEndpointKind() {
     return (kindSel && kindSel.value) ? kindSel.value : 'api';
   }
+  function _modelRefreshModeForApiEndpoint(url, endpointKind) {
+    if (endpointKind === 'proxy') return 'manual';
+    try {
+      if ((new URL(url)).hostname.toLowerCase() === 'generativelanguage.googleapis.com') return '';
+    } catch (_) {}
+    return 'auto';
+  }
   function _normalizeBaseUrl(raw) {
     let u = raw.trim();
     // Fix common protocol typos
@@ -1081,7 +1088,8 @@ function initEndpointForm() {
       fd.append('base_url', url);
       const endpointKind = _apiEndpointKind();
       fd.append('endpoint_kind', endpointKind);
-      fd.append('model_refresh_mode', endpointKind === 'proxy' ? 'manual' : 'auto');
+      const refreshMode = _modelRefreshModeForApiEndpoint(url, endpointKind);
+      if (refreshMode) fd.append('model_refresh_mode', refreshMode);
       fd.append('model_refresh_timeout', '30');
       if (apiKey) fd.append('api_key', apiKey);
       if (provider.value && provider.selectedOptions && provider.selectedOptions[0]) {
@@ -1089,7 +1097,7 @@ function initEndpointForm() {
       }
       const epType = el('adm-epType');
       if (epType) fd.append('model_type', epType.value);
-      if (provider.value && /openrouter\.ai|ollama\.com/i.test(provider.value)) fd.append('require_models', 'true');
+      if (provider.value && /openrouter\.ai|ollama\.com|polza\.ai/i.test(provider.value)) fd.append('require_models', 'true');
       else fd.append('skip_probe', 'false');
       const res = await fetch('/api/model-endpoints', { method: 'POST', body: fd, credentials: 'same-origin' });
       const d = await res.json();

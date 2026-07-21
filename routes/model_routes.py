@@ -472,7 +472,11 @@ def _endpoint_kind(ep: Any) -> str:
 
 
 def _endpoint_refresh_mode(ep: Any, endpoint_kind: str | None = None) -> str:
-    return _normalize_refresh_mode(getattr(ep, "model_refresh_mode", None), endpoint_kind or _endpoint_kind(ep))
+    return _normalize_endpoint_refresh_mode(
+        getattr(ep, "model_refresh_mode", None),
+        endpoint_kind or _endpoint_kind(ep),
+        getattr(ep, "base_url", ""),
+    )
 
 
 def _endpoint_refresh_interval(ep: Any, category: str) -> float:
@@ -526,7 +530,13 @@ def _parse_model_list(raw: Any) -> List[str]:
             return []
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, list):
+            # Aggregator endpoints (e.g. Polza.ai) store the full JSON response
+            # with provider details in cached_models: {"data": [{"id": ..., ...}, ...]}.
+            # Extract model IDs from the data array instead of falling through
+            # to re.split() which would shred the JSON into garbage strings.
+            if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+                value = [m["id"] for m in parsed["data"] if isinstance(m, dict) and m.get("id")]
+            elif isinstance(parsed, list):
                 value = parsed
             else:
                 value = re.split(r"[\n,]+", text)
@@ -673,6 +683,18 @@ def _safe_build_headers(api_key: Optional[str], base_url: str) -> dict:
         return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
+def _redact_url_for_log(url: str) -> str:
+    """Return a URL safe for logs by removing userinfo and query/fragment."""
+    try:
+        parsed = urlparse(url or "")
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return urlunparse((parsed.scheme, host, parsed.path, "", "", ""))
+    except Exception:
+        return "<endpoint>"
+
+
 def _is_discovery_only_provider(provider: str) -> bool:
     return provider == "chatgpt-subscription"
 
@@ -815,7 +837,6 @@ def _is_loading_model_response(resp: Any) -> bool:
     return "loading model" in body.lower()
 
 
-
 def _openai_model_ids(data: Any) -> List[str]:
     """Extract OpenAI-style model IDs.
 
@@ -851,6 +872,99 @@ def _ollama_model_names(data: Any) -> List[str]:
     return out
 
 
+def _is_google_api_base(base_url: str) -> bool:
+    try:
+        return (urlparse(base_url).hostname or "").lower() == "generativelanguage.googleapis.com"
+    except Exception:
+        return False
+
+
+def _normalize_endpoint_refresh_mode(value: Any, endpoint_kind: str = "auto", base_url: str = "") -> str:
+    if not str(value or "").strip() and _is_google_api_base(base_url):
+        return "manual"
+    return _normalize_refresh_mode(value, endpoint_kind)
+
+
+def _google_native_root(base_url: str) -> str:
+    """Return the Gemini native API root for a Google endpoint.
+
+    Chat calls may be configured against Google's OpenAI-compatible
+    `/openai` path, but model catalog reads should use the native Models API
+    so we get Google's current Model resource shape.
+    """
+    try:
+        parsed = urlparse(base_url)
+    except Exception:
+        return "https://generativelanguage.googleapis.com/v1beta"
+    path = (parsed.path or "").rstrip("/")
+    if path.endswith("/openai"):
+        path = path[: -len("/openai")].rstrip("/")
+    if not path:
+        path = "/v1beta"
+    return urlunparse(parsed._replace(path=path, query="", fragment="")).rstrip("/")
+
+
+def _google_native_models_url(base_url: str) -> str:
+    return _google_native_root(base_url) + "/models"
+
+
+def _google_model_id_from_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    value = item.get("baseModelId") or item.get("name") or item.get("model") or ""
+    return str(value or "").strip().removeprefix("models/")
+
+
+def _google_model_supports_chat(item: Any) -> bool:
+    """Return whether a native Google Model resource supports chat generation."""
+    if not isinstance(item, dict):
+        return False
+    methods = item.get("supportedGenerationMethods")
+    if not isinstance(methods, list):
+        return False
+    chat_methods = {"generateContent", "generateMessage", "generateText", "generateAnswer"}
+    return any(method in chat_methods for method in methods)
+
+
+def _probe_google_models(base_url: str, api_key: str = None, timeout: int = 5, page_size: int = 1000) -> List[str]:
+    """Read Google's native paginated Models API.
+
+    This intentionally returns only provider-reported model IDs. Capability
+    mapping is handled by the model capability reader and must not infer from
+    names here.
+    """
+    url = _google_native_models_url(base_url)
+    try:
+        page_size = min(max(int(page_size or 1000), 1), 1000)
+    except Exception:
+        page_size = 1000
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["x-goog-api-key"] = api_key
+    params: Dict[str, Any] = {"pageSize": page_size}
+    models: List[str] = []
+    seen = set()
+    page_token = ""
+    for _ in range(20):
+        request_params = dict(params)
+        if page_token:
+            request_params["pageToken"] = page_token
+        r = httpx.get(url, headers=headers, params=request_params, timeout=timeout, verify=llm_verify())
+        r.raise_for_status()
+        data = r.json()
+        for item in data.get("models") or []:
+            if not _google_model_supports_chat(item):
+                continue
+            model_id = _google_model_id_from_item(item)
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                models.append(model_id)
+        page_token = str(data.get("nextPageToken") or "").strip()
+        if not page_token:
+            break
+    return models
+
+
 def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> List[str]:
     """Probe a base URL's /models endpoint and return list of model IDs.
     For Anthropic, queries their /v1/models API, falling back to hardcoded list."""
@@ -862,6 +976,17 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
         from src.chatgpt_subscription import fetch_available_models
         if api_key:
             return fetch_available_models(api_key, timeout=timeout)
+        return []
+    if _is_google_api_base(base):
+        try:
+            models = _probe_google_models(base, api_key, timeout=timeout)
+            if models:
+                return models
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            logger.warning(f"Google native models probe failed: HTTP {status}")
+        except Exception as e:
+            logger.warning(f"Google native models probe failed: {e}")
         return []
     if provider == "anthropic":
         # Try Anthropic's /v1/models endpoint first
@@ -1152,6 +1277,36 @@ def _merge_model_ids(*lists):
     return out
 
 
+def _is_mlx_deepseek_v4_repo_id(model_id: str) -> bool:
+    m = str(model_id or "").lower()
+    return "mlx-community/deepseek-v4" in m
+
+
+def _is_mlx_deepseek_v4_shim_id(model_id: str) -> bool:
+    m = str(model_id or "").lower()
+    return "/.cache/odysseus/mlx-shims/deepseek-v4" in m
+
+
+def _filter_mlx_deepseek_v4_repo_when_shimmed(model_ids):
+    """Hide the broken MLX repo id when a launch-specific shim id is available.
+
+    mlx_lm.server may advertise the original HF repo id even though generation
+    only works through Odysseus' sanitized local shim. Keep the shim as the
+    submitted model id and remove the raw repo id from the picker/default list.
+    """
+    ids = list(model_ids or [])
+    has_shim = any(_is_mlx_deepseek_v4_shim_id(m) for m in ids)
+    if not has_shim:
+        return ids
+    return [m for m in ids if not _is_mlx_deepseek_v4_repo_id(m)]
+
+
+def _model_display_name(model_id: str) -> str:
+    if _is_mlx_deepseek_v4_shim_id(model_id):
+        return str(model_id or "").rstrip("/").split("/")[-1] or "DeepSeek-V4-Flash-4bit"
+    return str(model_id or "").split("/")[-1]
+
+
 def _visible_models(cached_models, hidden_models, pinned_models=None):
     """Merge cached + pinned model IDs, then filter out hidden ones.
 
@@ -1165,6 +1320,7 @@ def _visible_models(cached_models, hidden_models, pinned_models=None):
         _normalize_model_ids(cached_models),
         _normalize_model_ids(pinned_models),
     )
+    merged = _filter_mlx_deepseek_v4_repo_when_shimmed(merged)
     if not hidden_models:
         return merged
     hidden = set(_normalize_model_ids(hidden_models))
@@ -1293,8 +1449,12 @@ def setup_model_routes(model_discovery):
                             "base": info["base"],
                             "api_key": info["api_key"],
                             "timeout": info["timeout"],
+                            "endpoint_kinds": {},
                             "endpoint_ids": [],
-                        })["endpoint_ids"].append(info["id"])
+                        })
+                        grp = groups[info["key"]]
+                        grp["endpoint_ids"].append(info["id"])
+                        grp["endpoint_kinds"][info["id"]] = info["kind"]
 
                     for key in groups:
                         st = _refresh_state.setdefault(key, {})
@@ -1303,22 +1463,52 @@ def setup_model_routes(model_discovery):
 
                     def _probe_one(key: str, data: Dict[str, Any]):
                         try:
-                            ids = _probe_endpoint(data["base"], data.get("api_key"), timeout=data.get("timeout") or 2)
-                            return key, data["endpoint_ids"], ids, None
+                            endpoint_kinds = data.get("endpoint_kinds", {})
+                            is_aggregator = any(
+                                k in ("api", "proxy") for k in endpoint_kinds.values()
+                            )
+                            if is_aggregator:
+                                # Aggregator endpoints: fetch the full models response with
+                                # provider details and store the raw JSON in cached_models.
+                                base = data["base"].rstrip("/")
+                                sep = "&" if "?" in base else "?"
+                                url = f"{base}/models{sep}type=chat&include_providers=true"
+                                headers = _safe_build_headers(data.get("api_key"), base)
+                                try:
+                                    r = httpx.get(url, headers=headers, timeout=data.get("timeout") or 10)
+                                    r.raise_for_status()
+                                    raw_text = r.text
+                                    # Parse to extract simple model IDs for validation
+                                    parsed = r.json()
+                                    ids = [m.get("id") for m in (parsed.get("data") or []) if m.get("id")]
+                                    # Store the full JSON string so provider details are available
+                                    return key, data["endpoint_ids"], ids, None, raw_text
+                                except Exception as e:
+                                    return key, data["endpoint_ids"], None, e, None
+                            else:
+                                ids = _probe_endpoint(data["base"], data.get("api_key"), timeout=data.get("timeout") or 2)
+                                return key, data["endpoint_ids"], ids, None, None
                         except Exception as e:
-                            return key, data["endpoint_ids"], None, e
+                            return key, data["endpoint_ids"], None, e, None
 
                     if groups:
                         with ThreadPoolExecutor(max_workers=min(4, len(groups))) as pool:
                             futures = [pool.submit(_probe_one, key, data) for key, data in groups.items()]
                             for fut in as_completed(futures):
-                                key, endpoint_ids, ids, err = fut.result()
+                                result = fut.result()
+                                key, endpoint_ids, ids, err = result[0], result[1], result[2], result[3]
+                                raw_text = result[4] if len(result) > 4 else None
                                 st = _refresh_state.setdefault(key, {})
                                 if ids:
                                     for ep_id in endpoint_ids:
                                         ep_obj = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
                                         if ep_obj:
-                                            ep_obj.cached_models = json.dumps(ids)
+                                            # Aggregator endpoints: store the full JSON response
+                                            # (with provider details) instead of just model ID list.
+                                            if raw_text:
+                                                ep_obj.cached_models = raw_text
+                                            else:
+                                                ep_obj.cached_models = json.dumps(ids)
                                             changed = True
                                     st["last_success"] = _time.time()
                                     st["fail_count"] = 0
@@ -1371,11 +1561,34 @@ def setup_model_routes(model_discovery):
             provider = _safe_detect_provider(base)
             # Merge cached + pinned models, then filter out hidden ones
             ep_model_type = getattr(ep, "model_type", None) or "llm"
-            model_ids = _visible_models(
-                _cached_model_ids(ep),
-                ep.hidden_models,
-                getattr(ep, "pinned_models", None),
-            )
+
+            # Aggregator endpoints (e.g. Polza.ai) store the full JSON response
+            # with provider details in cached_models. Detect this format and
+            # extract proper model IDs from the JSON data array instead of using
+            # _cached_model_ids() which splits on commas and corrupts the list.
+            _raw_cm = getattr(ep, "cached_models", None)
+            _agg_models = None
+            if isinstance(_raw_cm, str):
+                try:
+                    _p = json.loads(_raw_cm)
+                    if isinstance(_p, dict) and isinstance(_p.get("data"), list):
+                        _ids = [m["id"] for m in _p["data"] if isinstance(m, dict) and m.get("id")]
+                        if _ids:
+                            _agg_models = _ids
+                except Exception:
+                    pass
+            if _agg_models is not None:
+                model_ids = _visible_models(
+                    _agg_models,
+                    ep.hidden_models,
+                    getattr(ep, "pinned_models", None),
+                )
+            else:
+                model_ids = _visible_models(
+                    _cached_model_ids(ep),
+                    ep.hidden_models,
+                    getattr(ep, "pinned_models", None),
+                )
             # Build correct URL based on provider
             chat_url = build_chat_url(base)
             kind = _effective_endpoint_kind(ep, base)
@@ -1391,23 +1604,25 @@ def setup_model_routes(model_discovery):
                     if m not in curated:
                         curated.append(m)
                 extra = [m for m in extra if m not in pinned]
-                items.append({
+                _item = {
                     "host": "custom",
                     "port": 0,
                     "url": chat_url,
                     "models": curated,
-                    "models_display": [mid.split("/")[-1] for mid in curated],
+                    "models_display": [_model_display_name(mid) for mid in curated],
                     "models_extra": extra,
-                    "models_extra_display": [mid.split("/")[-1] for mid in extra],
+                    "models_extra_display": [_model_display_name(mid) for mid in extra],
                     "endpoint_id": ep.id,
                     "endpoint_name": ep.name,
                     "category": category,
                     "endpoint_kind": kind,
                     "model_type": ep_model_type,
-                })
+                }
+                if _agg_models is not None:
+                    _item["cached_models"] = _raw_cm
+                items.append(_item)
             else:
-                # Endpoint unreachable but still show it greyed out
-                items.append({
+                _item = {
                     "host": "custom",
                     "port": 0,
                     "url": chat_url,
@@ -1421,12 +1636,15 @@ def setup_model_routes(model_discovery):
                     "endpoint_kind": kind,
                     "model_type": ep_model_type,
                     "offline": True,
-                })
+                }
+                if _agg_models is not None:
+                    _item["cached_models"] = _raw_cm
+                items.append(_item)
 
         return {"hosts": [], "items": items}
 
     @router.get("/models")
-    def api_models(request: Request, refresh: bool = False, background: bool = True):
+    def api_models(request: Request, refresh: bool = False, background: bool = False):
         """Get available models — per-user (caller sees only their endpoints +
         legacy/shared null-owner rows). Cached per-user for 30s."""
         # Require auth; "" is the unconfigured single-user mode, treated as
@@ -1758,6 +1976,63 @@ def setup_model_routes(model_discovery):
                 # Refresh/Probe endpoints do the network work.
                 status = "online" if (all_models or pinned) else ("empty" if r.is_enabled else "offline")
                 ping = None
+                # When cached_models is empty, do a quick reachability probe.
+                # Bumped 1.0s → 3.5s because the user reported endpoints they
+                # were ACTIVELY chatting with showed "offline" — the previous
+                # 1s timeout was clipping live cloud endpoints (DeepSeek can
+                # take 1.5–2.5s on /v1/models when their region is under load,
+                # vLLM on a remote GPU box behind SSH can also push past 1s).
+                # 3.5s still keeps the picker render snappy in the common
+                # "everything's already cached" path because this branch only
+                # runs for endpoints with an empty cached_models.
+                if not all_models and not pinned and r.is_enabled:
+                    base_for_ping = _normalize_base(r.base_url)
+                    kind_for_ping = _effective_endpoint_kind(r, base_for_ping)
+                    ping_timeout = 10.0 if _classify_endpoint(base_for_ping, kind_for_ping) == "local" else 3.5
+                    ping = _ping_endpoint(r.base_url, r.api_key, timeout=ping_timeout)
+                    if ping.get("reachable"):
+                        status = "loading" if ping.get("loading") else "empty"
+                        if ping.get("loading"):
+                            base = _normalize_base(r.base_url)
+                            kind = _effective_endpoint_kind(r, base)
+                            results.append({
+                                "id": r.id,
+                                "name": r.name,
+                                "base_url": r.base_url,
+                                "has_key": bool(r.api_key),
+                                "api_key_fingerprint": _api_key_fingerprint(r.api_key),
+                                "is_enabled": r.is_enabled,
+                                "models": visible,
+                                "pinned_models": pinned,
+                                "hidden_count": len(hidden),
+                                "online": True,
+                                "status": status,
+                                "ping_error": (ping or {}).get("error") if ping else None,
+                                "model_type": getattr(r, "model_type", None) or "llm",
+                                "supports_tools": getattr(r, "supports_tools", None),
+                                "endpoint_kind": kind,
+                                "category": _classify_endpoint(base, kind),
+                                "model_refresh_mode": _endpoint_refresh_mode(r, kind),
+                                "model_refresh_interval": getattr(r, "model_refresh_interval", None),
+                                "model_refresh_timeout": getattr(r, "model_refresh_timeout", None),
+                            })
+                            continue
+                        # Best-effort: if the probe came back reachable, try
+                        # to populate cached_models in the background so the
+                        # NEXT picker load shows "online" instead of "empty".
+                        # Failure here is silent — we already returned the
+                        # "empty" status, and the existing background refresh
+                        # path will eventually fill it in too.
+                        try:
+                            probed = _probe_endpoint(r.base_url, r.api_key, timeout=max(5, int(ping_timeout)))
+                            if probed:
+                                r.cached_models = json.dumps(probed)
+                                db.commit()
+                                all_models = probed
+                                visible = _visible_models(all_models, r.hidden_models, pinned)
+                                status = "online"
+                        except Exception as _refill_err:
+                            logger.debug(f"opportunistic cached_models refill failed for {r.id}: {_refill_err!r}")
                 base = _normalize_base(r.base_url)
                 kind = _effective_endpoint_kind(r, base)
                 results.append({
@@ -1774,6 +2049,7 @@ def setup_model_routes(model_discovery):
                     "status": status,
                     "ping_error": (ping or {}).get("error") if ping else None,
                     "model_type": getattr(r, "model_type", None) or "llm",
+                    "cached_models": getattr(r, "cached_models", None),
                     "supports_tools": getattr(r, "supports_tools", None),
                     "endpoint_kind": kind,
                     "category": _classify_endpoint(base, kind),
@@ -1823,7 +2099,7 @@ def setup_model_routes(model_discovery):
             name = base_url.replace("http://", "").replace("https://", "").split("/")[0]
 
         requested_kind = _normalize_endpoint_kind(endpoint_kind)
-        refresh_mode = _normalize_refresh_mode(model_refresh_mode, requested_kind)
+        refresh_mode = _normalize_endpoint_refresh_mode(model_refresh_mode, requested_kind, base_url)
         refresh_interval = _parse_positive_int(model_refresh_interval, minimum=30, maximum=86400)
         refresh_timeout = _parse_positive_int(model_refresh_timeout, minimum=1, maximum=60)
         require_model_list = _truthy(require_models)
@@ -1887,7 +2163,14 @@ def setup_model_routes(model_discovery):
                 if api_key.strip() and not existing.api_key:
                     existing.api_key = api_key.strip()
                     changed = True
-                if should_probe:
+                # Keep duplicate endpoint registration cheap. This path is hit
+                # by Cookbook/browser auto-register flows and can run while the
+                # user is sending a chat message. Probing a stale LAN endpoint
+                # here used to hold the request open for tens of seconds and
+                # contend with session creation, making "send" feel blocked.
+                # Explicit "require models" calls still probe; normal refresh
+                # belongs to /model-endpoints/{id}/models or /probe.
+                if require_model_list:
                     probed_models = _probe_endpoint(
                         base_url,
                         (api_key.strip() or existing.api_key or None),
@@ -2211,6 +2494,7 @@ def setup_model_routes(model_discovery):
             _user_prefs = _load_for_user(_user) or {}
             ep_id = (_user_prefs.get("default_endpoint_id") or "").strip()
             model = (_user_prefs.get("default_model") or "").strip()
+            provider = (_user_prefs.get("default_provider") or "").strip()
             _fallbacks = _user_prefs.get("default_model_fallbacks") or []
             # If user has no personal default, fall back to global default
             # But only based on the "share_defaults_with_users" flag
@@ -2225,6 +2509,7 @@ def setup_model_routes(model_discovery):
         else:
             ep_id = settings.get("default_endpoint_id", "")
             model = settings.get("default_model", "")
+            provider = settings.get("default_provider", "")
             _fallbacks = settings.get("default_model_fallbacks") or []
         db = SessionLocal()
         try:
@@ -2278,7 +2563,7 @@ def setup_model_routes(model_discovery):
                     _last_q = owner_filter(_last_q, ModelEndpoint, _user, include_shared=False)
                 ep = _last_q.first()
             if not ep:
-                return {"endpoint_id": "", "endpoint_url": "", "model": ""}
+                return {"endpoint_id": "", "endpoint_url": "", "model": "", "default_provider": ""}
             base = _normalize_base(ep.base_url)
             chat_url = build_chat_url(base)
             if not model and (getattr(ep, "cached_models", None) or getattr(ep, "pinned_models", None)):
@@ -2288,7 +2573,13 @@ def setup_model_routes(model_discovery):
                         model = visible[0]
                 except Exception:
                     pass
-            return {"endpoint_id": ep.id, "endpoint_url": chat_url, "model": model}
+            # Wire the default provider preference so aggregator endpoints
+            # (Polza.ai, OpenRouter, etc.) inject provider: {only: [name]}
+            # into the LLM request payload automatically.
+            if model and provider:
+                from src.llm_core import set_provider_preference as _set_prov_pref
+                _set_prov_pref(model, provider)
+            return {"endpoint_id": ep.id, "endpoint_url": chat_url, "model": model, "default_provider": provider}
         finally:
             db.close()
 
@@ -2326,7 +2617,11 @@ def setup_model_routes(model_discovery):
                 if "endpoint_kind" in body:
                     ep.endpoint_kind = _normalize_endpoint_kind(body.get("endpoint_kind"))
                 if "model_refresh_mode" in body:
-                    ep.model_refresh_mode = _normalize_refresh_mode(body.get("model_refresh_mode"), _endpoint_kind(ep))
+                    ep.model_refresh_mode = _normalize_endpoint_refresh_mode(
+                        body.get("model_refresh_mode"),
+                        _endpoint_kind(ep),
+                        ep.base_url,
+                    )
                 if "model_refresh_interval" in body:
                     interval = _parse_positive_int(body.get("model_refresh_interval"), minimum=30, maximum=86400)
                     ep.model_refresh_interval = interval

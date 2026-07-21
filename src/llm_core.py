@@ -8,12 +8,99 @@ import hashlib
 import threading
 import re
 import os
+from contextlib import asynccontextmanager
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
-from src.model_context import get_context_length, DEFAULT_CONTEXT
+from src.model_context import get_context_length, DEFAULT_CONTEXT, is_local_endpoint
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# Provider preferences for aggregator endpoints (Polza.ai, OpenRouter, etc.).
+# Call set_provider_preference(model_id, provider_name) before sending a request
+# to inject provider: {only: [provider_name]} into the payload's extra_body.
+_provider_preferences: Dict[str, str] = {}  # model_id -> provider_name
+
+def set_provider_preference(model_id: str, provider_name: str):
+    """Set which sub-provider to use for a given model on aggregator endpoints."""
+    _provider_preferences[model_id] = provider_name
+
+def _get_provider_preference(model_id: str) -> Optional[str]:
+    return _provider_preferences.get(model_id)
+
+_LOCAL_MODEL_LOCK = asyncio.Lock()
+_LOCAL_MODEL_WAITING_FOREGROUND = 0
+_LOCAL_MODEL_CURRENT: Dict[str, object] = {}
+
+
+def _local_model_gate_enabled() -> bool:
+    return os.getenv("ODYSSEUS_LOCAL_MODEL_GATE", "true").lower() not in {"0", "false", "no", "off"}
+
+
+def _gate_workload(workload: Optional[str]) -> str:
+    return "background" if str(workload or "").lower() == "background" else "foreground"
+
+
+@asynccontextmanager
+async def _local_model_slot(target_url: str, model: str, workload: Optional[str] = None):
+    """Serialize local model traffic, with foreground chat taking priority.
+
+    Most local servers expose one GPU/CPU generation pipe even when their HTTP
+    API accepts multiple requests. Letting scheduled email/tasks and foreground
+    chat hit that pipe together creates the user-visible "streams crossed" and
+    "prompt waited behind a task" failure mode. Cloud providers are left alone.
+    """
+    if not _local_model_gate_enabled() or not is_local_endpoint(target_url):
+        yield
+        return
+
+    global _LOCAL_MODEL_WAITING_FOREGROUND
+    kind = _gate_workload(workload)
+    current_task = asyncio.current_task()
+    if kind == "foreground":
+        _LOCAL_MODEL_WAITING_FOREGROUND += 1
+        current = dict(_LOCAL_MODEL_CURRENT)
+        if current.get("workload") == "background":
+            task = current.get("task")
+            if isinstance(task, asyncio.Task) and not task.done():
+                logger.info(
+                    "[model-gate] cancelling background local model call for foreground request model=%s",
+                    model,
+                )
+                task.cancel()
+    else:
+        # Background work should not jump in while the browser/chat is active
+        # or while a foreground request is waiting to acquire the local model.
+        try:
+            from src.interactive_gate import has_foreground_activity
+        except Exception:
+            has_foreground_activity = lambda: False  # type: ignore
+        while _LOCAL_MODEL_WAITING_FOREGROUND > 0 or has_foreground_activity():
+            await asyncio.sleep(0.25)
+
+    acquired = False
+    try:
+        await _LOCAL_MODEL_LOCK.acquire()
+        acquired = True
+        if kind == "foreground":
+            _LOCAL_MODEL_WAITING_FOREGROUND = max(0, _LOCAL_MODEL_WAITING_FOREGROUND - 1)
+        _LOCAL_MODEL_CURRENT.clear()
+        _LOCAL_MODEL_CURRENT.update({
+            "task": current_task,
+            "workload": kind,
+            "url": target_url,
+            "model": model,
+            "started": time.time(),
+        })
+        yield
+    finally:
+        if kind == "foreground":
+            _LOCAL_MODEL_WAITING_FOREGROUND = max(0, _LOCAL_MODEL_WAITING_FOREGROUND - 1)
+        if acquired and _LOCAL_MODEL_LOCK.locked():
+            owner = _LOCAL_MODEL_CURRENT.get("task")
+            if owner is current_task:
+                _LOCAL_MODEL_CURRENT.clear()
+            _LOCAL_MODEL_LOCK.release()
 
 class LLMConfig:
     """Configuration constants for LLM operations."""
@@ -198,6 +285,75 @@ def _stream_delta_event(text: str, *, thinking: bool = False) -> str:
     if thinking:
         payload["thinking"] = True
     return f"data: {json.dumps(payload)}\n\n"
+
+
+_DEGENERATE_WORD_RE = re.compile(r"[A-Za-z0-9_\u0370-\u03ff\u0400-\u04ff]+")
+
+
+class _DegenerateStreamGuard:
+    """Detect local-model token collapse before it floods the UI.
+
+    Some self-hosted models fail by repeating one token forever ("Var Var Var",
+    "Summer Summer ..."). This is not a useful response and can burn context,
+    browser memory, and GPU time. Keep the guard conservative: only fire on long
+    same-token runs or a very dominant repeated token in the recent window.
+    """
+
+    def __init__(self, model: str):
+        self.model = model or "model"
+        self.last_token = ""
+        self.same_run = 0
+        self.recent_tokens: List[str] = []
+        self.total_chars = 0
+
+    def check(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        self.total_chars += len(text)
+        tokens = [t.lower() for t in _DEGENERATE_WORD_RE.findall(text) if len(t) >= 2]
+        if not tokens:
+            return None
+        for token in tokens:
+            if token == self.last_token:
+                self.same_run += 1
+            else:
+                self.last_token = token
+                self.same_run = 1
+            self.recent_tokens.append(token)
+        if len(self.recent_tokens) > 96:
+            self.recent_tokens = self.recent_tokens[-96:]
+
+        reason = None
+        if self.same_run >= 28 and self.total_chars >= 100:
+            reason = f"repeated '{self.last_token}' {self.same_run} times"
+        elif len(self.recent_tokens) >= 72:
+            top = max(set(self.recent_tokens), key=self.recent_tokens.count)
+            count = self.recent_tokens.count(top)
+            if count >= 60 and count / max(len(self.recent_tokens), 1) >= 0.78:
+                reason = f"repeated '{top}' {count}/{len(self.recent_tokens)} recent tokens"
+        if not reason and len(self.recent_tokens) >= 80:
+            # Phrase loops are common on some local quantized MLX/MoE models:
+            # "Also be a software developer mode?" repeated forever will not
+            # trip the single-token guard above, but it is still a wedged
+            # generation. Require many repeats of the same 4-gram so normal
+            # prose/list formatting is not interrupted.
+            grams = [tuple(self.recent_tokens[i:i + 4]) for i in range(0, len(self.recent_tokens) - 3)]
+            if grams:
+                top_gram = max(set(grams), key=grams.count)
+                gram_count = grams.count(top_gram)
+                if gram_count >= 10:
+                    reason = f"repeated phrase '{' '.join(top_gram)}' {gram_count} times"
+
+        if not reason:
+            return None
+
+        logger.warning("[degenerate-stream] aborting model=%s reason=%s", self.model, reason)
+        message = (
+            f"Stopped generation: {self.model} started repeating tokens "
+            f"({reason}). Try a different model or lower temperature."
+        )
+        return f'event: error\ndata: {json.dumps({"status": 502, "text": message, "error": message})}\n\n'
+
 
 def _model_activity_key(url: str, model: str) -> str:
     return f"{(url or '').strip()}|{(model or '').strip()}"
@@ -622,6 +778,36 @@ def apply_kimi_code_headers(headers: Optional[Dict], url: str) -> Dict[str, str]
     return h
 
 
+async def apply_kimi_code_headers_async(client, headers: Optional[Dict], url: str) -> Dict[str, str]:
+    """Pick a Kimi Code User-Agent without blocking the event loop."""
+    h = dict(headers or {})
+    if not _is_kimi_code_url(url):
+        return h
+    base_key = _kimi_code_base_key(url)
+    cached = _kimi_code_ua_cache.get(base_key)
+    if cached:
+        h["User-Agent"] = cached
+        return h
+    models_url = base_key.rstrip("/") + "/models"
+    for ua in KIMI_CODE_USER_AGENTS:
+        trial = dict(h)
+        trial["User-Agent"] = ua
+        try:
+            r = await client.get(models_url, headers=trial, timeout=8)
+        except Exception:
+            continue
+        if _is_kimi_code_access_denied(r.status_code, r.content):
+            logger.debug("Kimi Code rejected User-Agent %s (403), trying next", ua)
+            continue
+        if r.status_code < 400:
+            _remember_kimi_code_user_agent(url, ua)
+            h["User-Agent"] = ua
+            return h
+        break
+    h.setdefault("User-Agent", KIMI_CODE_USER_AGENT)
+    return h
+
+
 def httpx_get_kimi_aware(url: str, headers: Optional[Dict], **kwargs):
     h = apply_kimi_code_headers(headers, url)
     if not _is_kimi_code_url(url):
@@ -655,7 +841,7 @@ def httpx_post_kimi_aware(url: str, headers: Optional[Dict], **kwargs):
 
 
 async def httpx_post_kimi_aware_async(client, url: str, headers: Optional[Dict], **kwargs):
-    h = apply_kimi_code_headers(headers, url)
+    h = await apply_kimi_code_headers_async(client, headers, url)
     if not _is_kimi_code_url(url):
         return await client.post(url, headers=h, **kwargs)
     last = None
@@ -755,12 +941,58 @@ def _apply_local_cache_affinity(payload: Dict, url: str, session_id: Optional[st
     payload.setdefault("cache_prompt", True)
 
 
+def _is_local_minimax_mlx_request(url: str, model: str) -> bool:
+    """Local MLX MiniMax-family endpoints need conservative sampling defaults.
+
+    The OpenAI-compatible MLX server accepts repetition/frequency penalties.
+    Some large quantized MiniMax/MoE ports otherwise fall into visible reasoning
+    loops ("Also be...", "No.", etc.) even for trivial prompts.
+    """
+    if not model:
+        return False
+    m = model.lower()
+    if "minimax" not in m and "mini-max" not in m:
+        return False
+    try:
+        from src.model_context import is_local_endpoint
+        return is_local_endpoint(url)
+    except Exception:
+        return False
+
+
+def _apply_local_generation_stability(payload: Dict, url: str, model: str) -> None:
+    if not _is_local_minimax_mlx_request(url, model):
+        return
+    if "temperature" in payload:
+        try:
+            # MiniMax MLX quantized ports are very sensitive to chat/agent
+            # harness size. Character presets can ask for a warmer voice, but
+            # local MiniMax needs a final compatibility clamp or trivial
+            # prompts can fall into visible reasoning/repetition loops.
+            payload["temperature"] = min(float(payload.get("temperature") or 0.2), 0.2)
+        except (TypeError, ValueError):
+            payload["temperature"] = 0.2
+    payload.setdefault("top_p", 0.9)
+    payload.setdefault("top_k", 20)
+    payload.setdefault("repetition_penalty", 1.12)
+    payload.setdefault("repetition_context_size", 256)
+    payload.setdefault("frequency_penalty", 0.08)
+    payload.setdefault("frequency_context_size", 256)
+    payload.setdefault("presence_penalty", 0.02)
+    payload.setdefault("presence_context_size", 256)
+    payload.setdefault("stop", ["<|im_end|>", "<|endoftext|>", "</s>"])
+    # A max_tokens of 0 means "server default/unbounded" for many local
+    # endpoints. Keep simple chats from running forever when the model loops.
+    if not payload.get("max_tokens") and not payload.get("max_completion_tokens"):
+        payload["max_tokens"] = 2048
+
+
 def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
     if isinstance(headers, dict):
         h.update(headers)
     if provider == "openrouter":
-        h.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
+        h.setdefault("HTTP-Referer", "https://github.com/odysseus-dev/odysseus")
         h.setdefault("X-OpenRouter-Title", "Odysseus")
     if provider == "copilot":
         # Ensure the Copilot-required headers are present even when the caller
@@ -1484,6 +1716,11 @@ def list_model_ids(
     provider = _detect_provider(base_chat_url)
     if provider == "anthropic":
         return list(ANTHROPIC_MODELS)
+    # Aggregator endpoints: avoid live /v1/models probe; cached_models is
+    # populated by the auto-refresh subsystem (Fix 2).
+    from src.model_context import _configured_endpoint_kind
+    if _configured_endpoint_kind(base_chat_url) in ("api", "proxy"):
+        return cached or []
     try:
         h = {}
         if headers:
@@ -1602,6 +1839,11 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        # For aggregator endpoints, inject provider selection from user preference.
+        provider_pref = _get_provider_preference(model)
+        if provider_pref:
+            payload["provider"] = {"only": [provider_pref]}
+        _apply_local_generation_stability(payload, target_url, model)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
     try:
@@ -1711,6 +1953,7 @@ async def llm_call_async(
     max_retries: int = LLMConfig.MAX_RETRIES,
     prompt_type: Optional[str] = None,
     session_id: Optional[str] = None,
+    workload: str = "foreground",
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
@@ -1748,6 +1991,7 @@ async def llm_call_async(
             max_tokens=max_tokens,
             headers=headers,
             timeout=timeout,
+            workload=workload,
         ):
             event_is_error = False
             for line in str(chunk).splitlines():
@@ -1810,9 +2054,14 @@ async def llm_call_async(
         # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+        # For aggregator endpoints, inject provider selection from user preference.
+        provider_pref = _get_provider_preference(model)
+        if provider_pref:
+            payload["provider"] = {"only": [provider_pref]}
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
+        _apply_local_generation_stability(payload, target_url, model)
 
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
@@ -1823,9 +2072,10 @@ async def llm_call_async(
         attempt += 1
         start = time.time()
         try:
-            note_model_activity(target_url, model)
-            client = _get_http_client()
-            r = await httpx_post_kimi_aware_async(client, target_url, h, json=payload, timeout=call_timeout)
+            async with _local_model_slot(target_url, model, workload):
+                note_model_activity(target_url, model)
+                client = _get_http_client()
+                r = await httpx_post_kimi_aware_async(client, target_url, h, json=payload, timeout=call_timeout)
             duration = time.time() - start
             if not r.is_success:
                 friendly = _format_upstream_error(r.status_code, r.text, target_url)
@@ -1867,11 +2117,45 @@ async def llm_call_async(
                 raise HTTPException(502, f"POST {target_url} failed after {max_retries} attempts: {e}")
             await asyncio.sleep(LLMConfig.RETRY_DELAY)
 
+def _stream_target_url(url: str) -> str:
+    provider = _detect_provider(url)
+    if provider == "anthropic":
+        return _normalize_anthropic_url(url)
+    if provider == "ollama":
+        return _normalize_ollama_url(url)
+    if provider == "chatgpt-subscription":
+        return _normalize_chatgpt_subscription_url(url)
+    return _normalize_openai_chat_url(url)
+
+
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False):
+                     tool_choice_none: bool = False, workload: str = "foreground"):
+    target_url = _stream_target_url(url)
+    async with _local_model_slot(target_url, model, workload):
+        async for chunk in _stream_llm_inner(
+            url,
+            model,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            headers=headers,
+            timeout=timeout,
+            prompt_type=prompt_type,
+            tools=tools,
+            session_id=session_id,
+            tool_choice_none=tool_choice_none,
+        ):
+            yield chunk
+
+
+async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
+                            max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
+                            timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
+                            tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
+                            tool_choice_none: bool = False):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -1880,6 +2164,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
       - event: error                       — errors
       - data: [DONE]                       — end of stream
     """
+    from src.model_context import _configured_endpoint_kind
     provider = _detect_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
 
@@ -1929,7 +2214,35 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        # For aggregator endpoints with native search, skip app-side web search tools
+        # so the provider handles search natively.
+        _skip_app_search = False
+        if _configured_endpoint_kind(url) in ("api", "proxy"):
+            try:
+                from core.database import SessionLocal, ModelEndpoint
+                db = SessionLocal()
+                try:
+                    ep = db.query(ModelEndpoint).filter(
+                        ModelEndpoint.base_url == url, ModelEndpoint.is_enabled == True
+                    ).first()
+                    if ep and ep.cached_models:
+                        import json as _json
+                        cached = _json.loads(ep.cached_models)
+                        models = cached.get("data", []) if isinstance(cached, dict) else []
+                        for m in models:
+                            if m.get("id") == model:
+                                for p in m.get("providers", []):
+                                    if p.get("supports_native_web_search"):
+                                        _skip_app_search = True
+                                        break
+                                break
+                finally:
+                    db.close()
+            except Exception:
+                pass
         if tools:
+            if _skip_app_search:
+                tools = [t for t in tools if t.get("function", {}).get("name") not in ("web_search", "web_fetch")]
             payload["tools"] = tools
         elif tool_choice_none:
             payload["tool_choice"] = "none"
@@ -1944,7 +2257,12 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+        # For aggregator endpoints, inject provider selection from user preference.
+        provider_pref = _get_provider_preference(model)
+        if provider_pref:
+            payload["provider"] = {"only": [provider_pref]}
         _apply_local_cache_affinity(payload, url, session_id)
+        _apply_local_generation_stability(payload, target_url, model)
         h = _provider_headers(provider, headers)
         if provider == "copilot":
             from src.copilot import apply_request_headers
@@ -1961,6 +2279,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         yield f'event: error\ndata: {json.dumps({"error": f"Upstream {_host_key(target_url)} unreachable (cooldown active)", "status": 503})}\n\n'
         return
     note_model_activity(target_url, model)
+    degenerate_guard = _DegenerateStreamGuard(model)
 
     # ── ChatGPT Subscription / Codex Responses streaming ──
     if provider == "chatgpt-subscription":
@@ -1995,6 +2314,10 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                     if evt == "response.output_text.delta":
                         delta = data.get("delta") or ""
                         if delta:
+                            _degenerate = degenerate_guard.check(delta)
+                            if _degenerate:
+                                yield _degenerate
+                                return
                             yield f'data: {json.dumps({"delta": delta})}\n\n'
                     elif evt == "response.completed":
                         usage = (data.get("response") or {}).get("usage") or data.get("usage") or {}
@@ -2231,9 +2554,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             events.append(_stream_delta_event(part))
         return events
 
-    h = apply_kimi_code_headers(h, target_url)
     try:
         client = _get_http_client()
+        h = await apply_kimi_code_headers_async(client, h, target_url)
         async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
             _clear_host_dead(target_url)
             if r.status_code != 200:
@@ -2291,7 +2614,16 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                 )
                                 if "usage" in j and not _delta_has_output:
                                     u = j["usage"] or {}
-                                    _usage_data = {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)}
+                                    _usage_data = {
+                                        "input_tokens": u.get("prompt_tokens", 0),
+                                        "output_tokens": u.get("completion_tokens", 0),
+                                    }
+                                    # Aggregator endpoints (Polza.ai, OpenRouter, etc.) include
+                                    # the actual cost in the usage block.
+                                    if "cost_rub" in u:
+                                        _usage_data["cost_rub"] = float(u["cost_rub"])
+                                    elif "cost" in u:
+                                        _usage_data["cost_rub"] = float(u["cost"])
                                     # llama.cpp puts a `timings` block alongside `usage` with the
                                     # TRUE generation speed (predicted_per_second) — pure decode,
                                     # excluding prefill/network. Pass it through so the UI shows the
@@ -2327,11 +2659,19 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                                 reasoning = (reasoning + thinking_part) if reasoning else thinking_part
                                             content = text_part
                                         if reasoning:
+                                            _degenerate = degenerate_guard.check(reasoning)
+                                            if _degenerate:
+                                                yield _degenerate
+                                                return
                                             yield _stream_delta_event(reasoning, thinking=True)
                                         if content:
                                             content = _strip_visible_chat_template_artifacts(content)
                                             if not content:
                                                 continue
+                                            _degenerate = degenerate_guard.check(content)
+                                            if _degenerate:
+                                                yield _degenerate
+                                                return
                                             content = re.sub(r"<mm:think(\s+[^>]*)?>", r"<think\1>", content, flags=re.IGNORECASE)
                                             content = re.sub(r"</mm:think>", "</think>", content, flags=re.IGNORECASE)
                                             stripped = content.lstrip()
@@ -2496,8 +2836,9 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
     """Wrap stream_llm with an ordered fallback chain.
 
     `candidates` is a list of (url, model, headers). Each is tried in order,
-    but only retried on a *pre-content* failure — i.e. an ``event: error``
-    that arrives before any assistant text / tool-call data has been yielded.
+    but only retried on a *pre-content* failure — an ``event: error`` or an
+    empty completion before any assistant text / completed tool call is yielded.
+    Metadata is held until substantive output commits the candidate.
     Once a candidate has emitted real output we never switch (that would
     duplicate streamed tokens); a later error from that candidate passes
     through unchanged. The dead-host cooldown in stream_llm makes repeat
@@ -2516,6 +2857,7 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
         is_last = (i == len(cands) - 1)
         emitted = False
         retried = False
+        pending_metadata = []
         async for chunk in stream_llm(url, model, messages, headers=headers, **kwargs):
             if chunk.startswith("event: error"):
                 if not emitted and not is_last:
@@ -2528,34 +2870,67 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                     else:
                         logger.warning(f"[fallback] candidate {model} failed; trying next")
                     break
+                if not emitted:
+                    # A last-candidate error is already the clearest terminal
+                    # result; do not append an empty-completion error as well.
+                    yield chunk
+                    return
                 yield chunk
                 continue
-            # Any data chunk other than the terminal [DONE] means real output.
-            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+
+            event_data = {}
+            is_done = chunk.startswith("data: [DONE]")
+            if chunk.startswith("data: ") and not is_done:
                 try:
                     event_data = json.loads(chunk[6:])
                 except Exception:
-                    event_data = {}
-                if event_data.get("type") == "model_actual":
-                    yield chunk
-                    continue
+                    pass
+
+            delta = event_data.get("delta")
+            event_type = event_data.get("type")
+            substantive = (
+                isinstance(delta, str) and bool(delta)
+            ) or (
+                event_type == "tool_call_delta"
+            ) or (
+                event_type == "tool_calls"
+                and bool(event_data.get("calls"))
+            )
+
+            if substantive and not emitted:
                 # First real output from a NON-primary candidate: tell the client
                 # the selected model failed and another answered. Without this the
                 # fallback is invisible — a misconfigured provider looks like it
                 # works because the reply is shown under the originally selected
                 # model's name (e.g. a Bedrock/Claude endpoint that 400s every
                 # request but appears fine because another model silently answered).
-                if not emitted and i > 0:
+                if i > 0:
                     yield ('data: ' + json.dumps({
                         "type": "fallback",
                         "selected_model": primary_model,
                         "answered_by": model,
                         "reason": _summarize_stream_error(last_error),
                     }) + '\n\n')
+                # Metadata must not commit a candidate. Once real output arrives,
+                # flush it after any fallback notice and before the output itself.
+                for metadata_chunk in pending_metadata:
+                    yield metadata_chunk
+                pending_metadata.clear()
                 emitted = True
-            yield chunk
-        if not retried:
-            return  # candidate finished (success, or terminal error already sent)
-    # Every candidate failed pre-content — surface the last error.
-    if last_error:
-        yield last_error
+
+            if substantive or emitted:
+                yield chunk
+            elif not is_done:
+                pending_metadata.append(chunk)
+
+        if emitted:
+            return
+        if retried:
+            continue
+        if not is_last:
+            last_error = f'event: error\ndata: {json.dumps({"error": f"Model {model} returned no substantive output", "status": 502})}\n\n'
+            tag = "primary" if i == 0 else "candidate"
+            logger.warning(f"[fallback] {tag} {model} returned no substantive output; trying next")
+            continue
+        yield f'event: error\ndata: {json.dumps({"error": "All model candidates returned no substantive output", "status": 502})}\n\n'
+        return
